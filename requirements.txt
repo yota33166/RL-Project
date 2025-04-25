@@ -1,0 +1,11 @@
+torch
+torchvision
+torchrl
+tensorboard
+gymnasium == 0.29.1
+mujoco[all]
+genesis
+pygame
+matplotlib
+numpy
+matplotlib

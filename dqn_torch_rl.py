@@ -2,7 +2,7 @@ import os
 import tempfile
 import uuid
 import warnings
-from typing import Dict, List, Optional, Tuple, Union, Any, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from IPython import get_ipython
@@ -11,12 +11,12 @@ from torch import multiprocessing, nn
 from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyMemmapStorage, MultiStep, TensorDictReplayBuffer
 from torchrl.envs import (
+    EnvBase,
     EnvCreator,
     ExplorationType,
     ParallelEnv,
     RewardScaling,
     StepCounter,
-    EnvBase,
 )
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.transforms import (
@@ -75,7 +75,7 @@ init_bias: float = 2.0  # ネットワークの最終層のバイアス初期値
 def is_notebook() -> bool:
     """
     現在の実行環境がJupyter Notebookかどうかを判定する。
-    
+
     Returns:
         bool: Jupyter Notebookの場合はTrue、それ以外はFalse
     """
@@ -97,14 +97,14 @@ def make_env(
     num_workers: int = 1,
 ) -> TransformedEnv:
     """環境を作成する関数
-    
+
     CartPole-v1環境をピクセル画像ベースで作成し、必要な前処理を適用する。
-    
+
     Args:
         parallel (bool): 環境を並列に実行するかどうか
         obs_norm_sd (Dict[str, Any] | None): 観測値の正規化設定
         num_workers (int): 環境のワーカー数
-    
+
     Returns:
         TransformedEnv: 前処理が適用された環境
     """
@@ -153,13 +153,13 @@ def make_env(
 
 def get_norm_stats() -> Dict[str, Any]:
     """正規化の統計量を取得する関数
-    
+
     ObservationNormのinit_statsメソッドによって、[B, C, H, W]の入力を、
     1. バッチ次元で連結 (cat_dim=0)
     2. Cの次元以外をたたみ込んで統計量を算出 (reduce_dim=[-1, -2, -4])
     3. 計算後にH, W軸を保持 (keep_dims=(-1, -2))
     4. [C, 1, 1]の形状を持つlocとscaleテンソルを得る (state_dictメソッド)
-    
+
     Returns:
         Dict[str, Any]: 観測値の正規化設定
     """
@@ -176,12 +176,12 @@ def get_norm_stats() -> Dict[str, Any]:
 
 def make_model(dummy_env: EnvBase) -> Tuple[QValueActor, TensorDictSequential]:
     """DQNモデルを作成する関数
-    
+
     Args:
         dummy_env (EnvBase): モデル構造を決定するためのダミー環境
-    
+
     Returns:
-        Tuple[QValueActor, TensorDictSequential]: 
+        Tuple[QValueActor, TensorDictSequential]:
             - actor: 価値推定のためのQネットワーク
             - actor_explore: 探索機能付きのactor
     """
@@ -238,13 +238,13 @@ def get_replay_buffer(
     buffer_size: int, n_optim: int, batch_size: int, device: torch.device
 ) -> TensorDictReplayBuffer:
     """リプレイバッファを作成する関数
-    
+
     Args:
         buffer_size (int): バッファのサイズ
         n_optim (int): 最適化のステップ数
         batch_size (int): バッチサイズ
         device (torch.device): テンソルを配置するデバイス
-    
+
     Returns:
         TensorDictReplayBuffer: メモリマップベースのリプレイバッファ
     """
@@ -266,9 +266,9 @@ def get_collector(
     device: torch.device,
 ) -> Union[SyncDataCollector, MultiaSyncDataCollector]:
     """データコレクターを作成する関数
-    
+
     環境とのインタラクションを行い、学習データを収集するコレクターを作成する。
-    
+
     Args:
         stats (Dict[str, Any]): 観測値の正規化統計量
         num_collectors (int): コレクターの数
@@ -276,7 +276,7 @@ def get_collector(
         frames_per_batch (int): バッチあたりのフレーム数
         total_frames (int): 収集する総フレーム数
         device (torch.device): 使用するデバイス
-    
+
     Returns:
         Union[SyncDataCollector, MultiaSyncDataCollector]: データコレクター
     """
@@ -305,17 +305,15 @@ def get_collector(
     return data_collector
 
 
-def get_loss_module(
-    actor: QValueActor, gamma: float
-) -> Tuple[DQNLoss, SoftUpdate]:
+def get_loss_module(actor: QValueActor, gamma: float) -> Tuple[DQNLoss, SoftUpdate]:
     """損失関数モジュールとターゲットネットワーク更新機構を作成
-    
+
     Args:
         actor (QValueActor): ポリシーネットワーク
         gamma (float): 割引率
-    
+
     Returns:
-        Tuple[DQNLoss, SoftUpdate]: 
+        Tuple[DQNLoss, SoftUpdate]:
             - DQN損失計算モジュール
             - ターゲットネットワーク更新モジュール
     """
@@ -331,7 +329,7 @@ def get_loss_module(
 def print_csv_files_in_folder(folder_path: str) -> None:
     """
     フォルダ内のすべてのCSVファイルを見つけて、各ファイルの最初の10行を表示する。
-    
+
     Args:
         folder_path (str): フォルダの相対パス
     """
@@ -356,7 +354,7 @@ def print_csv_files_in_folder(folder_path: str) -> None:
 
 def main() -> None:
     """メイン処理関数
-    
+
     DQN学習の一連の流れを実行する。
     """
     # 観測値の正規化の統計量を計算
@@ -409,11 +407,11 @@ def main() -> None:
         flatten_tensordicts=True,  # テンソル辞書をフラット化
     )
     buffer_hook.register(trainer)
-    
+
     # 重み更新フックを登録
     weight_updater = UpdateWeights(collector, update_weights_interval=1)
     weight_updater.register(trainer)
-    
+
     # 検証報酬ロガーを登録
     recorder = LogValidationReward(
         record_interval=100,  # 100最適化ステップごとにログ

@@ -1,5 +1,6 @@
-torch
-torchvision
+# CUDA 11.8
+torch==2.6.0 --index-url https://download.pytorch.org/whl/cu118
+torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu118
 torchrl
 tensorboard
 gymnasium == 0.29.1

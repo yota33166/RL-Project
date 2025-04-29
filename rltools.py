@@ -114,6 +114,11 @@ class RLLogger:
         self.logger = logging.getLogger("RLLogger")
         self.logger.setLevel(logging.INFO)
 
+        # ハンドラの初期化
+        if not getattr(self.logger, "_initialized", False):
+            self.logger.handlers.clear()
+            self.logger._initialized = True
+
         # コンソールハンドラ
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(
@@ -131,6 +136,11 @@ class RLLogger:
         # タイミングロガーの設定
         self.timing_logger = logging.getLogger("TimingLogger")
         self.timing_logger.setLevel(logging.INFO)
+
+        if not getattr(self.timing_logger, "_initialized", False):
+            self.timing_logger.handlers.clear()
+            self.timing_logger._initialized = True
+
 
         timing_handler = logging.FileHandler(self.log_dir / "timing.log")
         timing_handler.setFormatter(
@@ -196,7 +206,7 @@ class RLLogger:
 
         return elapsed_time
 
-    def log_summery(self) -> None:
+    def log_summary(self) -> None:
         """ "全体の経過時間をログとTensorBoardに記録"""
         total_time = self.log_end_time("total_training")
 
@@ -254,4 +264,6 @@ class RLLogger:
             self.writer.add_scalar(name, value, epoch)
 
     def close(self):
+        self.logger.close()
+        self.timing_logger.close()
         self.writer.close()

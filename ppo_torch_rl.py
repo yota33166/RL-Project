@@ -1,34 +1,40 @@
+#!/usr/bin/env python3
 import warnings
-warnings.filterwarnings("ignore")
-from torch import multiprocessing
-
-
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
+from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
-from torch import nn
+from torch import multiprocessing, nn
+from torch.utils.tensorboard import SummaryWriter
 from torchrl.collectors import SyncDataCollector
 from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.envs import (Compose, DoubleToFloat, ObservationNorm, StepCounter,
-                          TransformedEnv)
+from torchrl.envs import (
+    Compose,
+    DoubleToFloat,
+    ObservationNorm,
+    StepCounter,
+    TransformedEnv,
+)
 from torchrl.envs.libs.gym import GymEnv, GymWrapper
-from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
+from torchrl.envs.utils import ExplorationType, check_env_specs, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torchrl.trainers import Trainer
 from tqdm import tqdm
-from tensordict import TensorDict
+
+warnings.filterwarnings("ignore")
 
 """ Define Hyperparameters """
 is_fork = multiprocessing.get_start_method() == "fork"
-device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork
-                      else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork else "cpu")
 
 num_cells = 256  # number of cells in each layer i.e. output dim.
 lr = 3e-4
@@ -37,7 +43,7 @@ max_grad_norm = 1.0
 """ Data collection parameters """
 frames_per_batch = 1000
 # For a complete training, bring the number of frames up to 1M
-total_frames = 1_000_000
+total_frames = 500_000
 
 """ PPO parameters """
 sub_batch_size = 64  # cardinality of the sub-samples gathered from the current data in the inner loop
@@ -49,9 +55,16 @@ gamma = 0.99
 lmbda = 0.95
 entropy_eps = 1e-4
 
-def make_env():
-    """ Define the environment """
-    base_env = GymEnv("InvertedDoublePendulum-v4", device=device, render_mode="human")
+env_name = "Ant-v4"
+
+save_dir = Path(f"{env_name}_{datetime.now().strftime('%b%d_%H-%M-%S')}")
+log_dir = Path("logs") / save_dir
+model_dir = Path("models") / save_dir
+
+
+def make_env(render_mode=None, load_and_eval=False):
+    """Define the environment"""
+    base_env = GymEnv(env_name=env_name, device=device, render_mode=render_mode)
 
     env = TransformedEnv(
         base_env,
@@ -62,30 +75,49 @@ def make_env():
             StepCounter(),
         ),
     )
-    env.transform[0].init_stats(num_iter=1000, reduce_dim=0, cat_dim=0)
+    if load_and_eval:
+        # モデルデータ読み込み
+        ckpt = torch.load(model_dir / "best_model.pt", map_location=device)
+        policy_module.load_state_dict(ckpt["policy_state_dict"])
+        value_module.load_state_dict(ckpt["value_state_dict"])
+        obs_norm = env.transform[0]
+        state_dict = ckpt["obsnorm_state_dict"]
+
+        obs_norm.loc = torch.nn.Parameter(
+            state_dict["loc"].clone(), requires_grad=False
+        )
+        obs_norm.scale = torch.nn.Parameter(
+            state_dict["scale"].clone(), requires_grad=False
+        )
+        # optim.load_state_dict(ckpt["optimizer_state_dict"])
+        # scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        # current_frame = ckpt.get("frame", 0)  # フレーム数の復元
+    else:
+        env.transform[0].init_stats(num_iter=1000, reduce_dim=0, cat_dim=0)
 
     return env
 
+
 env = make_env()
 
-print("-" * 50)
-print("normalization constant shape:", env.transform[0].loc.shape)
-print("-" * 50)
-print("observation_spec:", env.observation_spec)
-print("-" * 50)
-print("reward_spec:", env.reward_spec)
-print("-" * 50)
-print("input_spec:", env.input_spec)
-print("-" * 50)
-print("action_spec (as defined by input_spec):", env.action_spec)
-print("-" * 50)
+# print("-" * 50)
+# print("normalization constant shape:", env.transform[0].loc.shape)
+# print("-" * 50)
+# print("observation_spec:", env.observation_spec)
+# print("-" * 50)
+# print("reward_spec:", env.reward_spec)
+# print("-" * 50)
+# print("input_spec:", env.input_spec)
+# print("-" * 50)
+# print("action_spec (as defined by input_spec):", env.action_spec)
+# print("-" * 50)
 
-check_env_specs(env)
-print("-" * 50)
-rollout = env.rollout(3)
-print("rollout of three steps:", rollout)
-print("Shape of the rollout TensorDict:", rollout.batch_size)
-print("-" * 50)
+# check_env_specs(env)
+# print("-" * 50)
+# rollout = env.rollout(3)
+# print("rollout of three steps:", rollout)
+# print("Shape of the rollout TensorDict:", rollout.batch_size)
+# print("-" * 50)
 
 actor_net = nn.Sequential(
     nn.LazyLinear(num_cells, device=device),
@@ -151,10 +183,10 @@ replay_buffer = ReplayBuffer(
 
 """ Loss function """
 advantage_module = GAE(
-    gamma=gamma, 
-    lmbda=lmbda, 
-    value_network=value_module, 
-    average_gae=True, 
+    gamma=gamma,
+    lmbda=lmbda,
+    value_network=value_module,
+    average_gae=True,
     device=device,
 )
 
@@ -174,13 +206,15 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optim, total_frames // frames_per_batch, 0.0
 )
 
-
-""" Training loop """
+""" Training"""
 
 
 def train():
     logs = defaultdict(list)
+    writer = SummaryWriter(log_dir=log_dir)
     pbar = tqdm(total=total_frames)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
     eval_str = ""
     current_frame = 0
     best_eval_reward = -float("inf")
@@ -188,7 +222,9 @@ def train():
     # designed to collect:
     for i, tensordict_data in enumerate(collector):
         # we now have a batch of data to work with. Let's learn something from it.
-        num_frames = tensordict_data.numel()  # tensordict_data に含まれるタイムステップ数
+        num_frames = (
+            tensordict_data.numel()
+        )  # tensordict_data に含まれるタイムステップ数
         for _ in range(num_epochs):
             # We'll need an "advantage" signal to make PPO work.
             # We re-compute it at each epoch as its value depends on the value
@@ -217,13 +253,20 @@ def train():
         pbar.update(num_frames)
         current_frame += num_frames
         logs["frames"].append(current_frame)
-        cum_reward_str = (
-            f"average reward={logs['reward'][-1]: 4.4f} (init={logs['reward'][0]: 4.4f})"
-        )
+        cum_reward_str = f"average reward=\
+            {logs['reward'][-1]: 4.4f} (init={logs['reward'][0]: 4.4f})"
         logs["step_count"].append(tensordict_data["step_count"].max().item())
         stepcount_str = f"step count (max): {logs['step_count'][-1]}"
         logs["lr"].append(optim.param_groups[0]["lr"])
         lr_str = f"lr policy: {logs['lr'][-1]: 4.4f}"
+        # TensorBoard に scalar 値を書き込み
+        writer.add_scalar("Loss/Total", loss_value.item(), i)
+        writer.add_scalar("Loss/Objective", loss_vals["loss_objective"].item(), i)
+        writer.add_scalar("Loss/Critic", loss_vals["loss_critic"].item(), i)
+        writer.add_scalar("Loss/Entropy", loss_vals["loss_entropy"].item(), i)
+        writer.add_scalar("Reward/BatchMean", logs["reward"][-1], i)
+        writer.add_scalar("StepCount/Max", logs["step_count"][-1], i)
+        writer.add_scalar("LearningRate", logs["lr"][-1], i)
         if i % 10 == 0:
             # We evaluate the policy once every 10 batches of data.
             # Evaluation is rather simple: execute the policy without exploration
@@ -234,8 +277,8 @@ def train():
             with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
                 # execute a rollout with the trained policy
                 eval_rollout = env.rollout(1000, policy_module)
-                eval_sum = eval_rollout["next", "reward"].sum().item()
-                logs["eval reward"].append(eval_rollout["next", "reward"].mean().item())
+                eval_mean = eval_rollout["next", "reward"].mean().item()
+                logs["eval reward"].append(eval_mean)
                 logs["eval reward (sum)"].append(
                     eval_rollout["next", "reward"].sum().item()
                 )
@@ -245,51 +288,48 @@ def train():
                     f"(init: {logs['eval reward (sum)'][0]: 4.4f}), "
                     f"eval step-count: {logs['eval step_count'][-1]}"
                 )
+                writer.add_scalar("Evaluation/RewardMean", logs["eval reward"][-1], i)
+                writer.add_scalar(
+                    "Evaluation/RewardSum", logs["eval reward (sum)"][-1], i
+                )
+                writer.add_scalar(
+                    "Evaluation/StepCountMax", logs["eval step_count"][-1], i
+                )
                 del eval_rollout
-            if eval_sum > best_eval_reward:
-                best_eval_reward = eval_sum
+            if eval_mean > best_eval_reward:
+                best_eval_reward = eval_mean
                 # 例: モデル、オプティマイザ、スケジューラをまとめて保存
-                torch.save({
-                    "policy_state_dict": policy_module.state_dict(),
-                    "value_state_dict":  value_module.state_dict(),
-                    "optimizer_state_dict": optim.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "obsnorm_state_dict":  env.transform[0].state_dict(),
-                    "frame": current_frame,            # 任意で学習ステップ数など
-                }, "model_data.pth")
-        pbar.set_description(", ".join([eval_str, cum_reward_str, stepcount_str, lr_str]))
+                torch.save(
+                    {
+                        "policy_state_dict": policy_module.state_dict(),
+                        "value_state_dict": value_module.state_dict(),
+                        "optimizer_state_dict": optim.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "obsnorm_state_dict": env.transform[0].state_dict(),
+                        "frame": current_frame,  # 任意で学習ステップ数など
+                    },
+                    model_dir / "best_model.pt",
+                )
+        pbar.set_description(
+            ", ".join([eval_str, cum_reward_str, stepcount_str, lr_str])
+        )
 
         # We're also using a learning rate scheduler. Like the gradient clipping,
         # this is a nice-to-have but nothing necessary for PPO to work.
         scheduler.step()
+    writer.close()
 
 
-train()
+# train()
 
-# モデルデータ読み込み
-ckpt = torch.load("model_data.pth", map_location=device)
-policy_module.load_state_dict(ckpt["policy_state_dict"])
-value_module.load_state_dict(ckpt["value_state_dict"])
-env.transform[0].load_state_dict(ckpt["obsnorm_state_dict"])
-# optim.load_state_dict(ckpt["optimizer_state_dict"])
-# scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-current_frame = ckpt.get("frame", 0)  # 復元されたフレーム数
-
+model_dir = Path("models") / "Ant-v4_Apr30_16-50-57"
+env = make_env(render_mode="human", load_and_eval=True)
 # 評価モードに切り替え
 policy_module.eval()
 value_module.eval()
 env.transform[0].eval()
 
-# GymEnv は render() を underlying Gym 環境にフォワードする
-# （TorchRL では未定義メソッドは base_env._env に委譲される）
-env_td = env.reset()  # TensorDict を返す
-done = False
-
-with set_exploration_type(ExplorationType.DETERMINISTIC):
-    while not done:
-        action = policy_module(env_td)
-        # ステップ実行
-        next_env_td = env.step(action)
-        env.render()
-        env_td = next_env_td
-        done = bool(next_env_td["next", "done"].item())
+with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+    env.rollout(
+        10000, policy_module, break_when_any_done=True
+    )  # 10000 ステップのロールアウトを実行

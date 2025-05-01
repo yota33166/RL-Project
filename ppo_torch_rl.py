@@ -16,9 +16,11 @@ from torchrl.data.replay_buffers import ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.envs import (
+    EnvCreator,
     Compose,
     DoubleToFloat,
     ObservationNorm,
+    ParallelEnv,
     StepCounter,
     TransformedEnv,
 )
@@ -33,7 +35,8 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
 """ Define Hyperparameters """
-is_fork = multiprocessing.get_start_method() == "fork"
+mp_context = multiprocessing.get_start_method()
+is_fork = mp_context == "fork"
 device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork else "cpu")
 
 num_cells = 256  # number of cells in each layer i.e. output dim.
@@ -61,45 +64,126 @@ save_dir = Path(f"{env_name}_{datetime.now().strftime('%b%d_%H-%M-%S')}")
 log_dir = Path("logs") / save_dir
 model_dir = Path("models") / save_dir
 
+def env_maker(env_name, device, render_mode=None):
+    env = GymEnv(
+        env_name=env_name,
+        from_pixels=False,
+        pixels_only=False,
+        device=device,
+        render_mode=render_mode,
+    )
+    return env
 
-def make_env(render_mode=None, load_and_eval=False):
-    """Define the environment"""
-    base_env = GymEnv(env_name=env_name, device=device, render_mode=render_mode)
+def make_env(
+    parallel=False,
+    obs_norm_sd=None,
+    num_workers=1,
+    maker=env_maker,
+    render_mode=None,
+):
+    if obs_norm_sd is None:
+        obs_norm_sd = {"standard_normal": True}
 
+    if parallel:
+        base_env = ParallelEnv(
+            num_workers,
+            EnvCreator(maker),
+            serial_for_single=True,
+            mp_start_method=mp_context,
+        )
+    else:
+        base_env = env_maker(env_name, device, render_mode=render_mode)
     env = TransformedEnv(
         base_env,
         Compose(
             # normalize observations
-            ObservationNorm(in_keys=["observation"]),
+            ObservationNorm(in_keys=["observation"], **obs_norm_sd),
             DoubleToFloat(),
             StepCounter(),
         ),
     )
-    if load_and_eval:
-        # モデルデータ読み込み
-        ckpt = torch.load(model_dir / "best_model.pt", map_location=device)
-        policy_module.load_state_dict(ckpt["policy_state_dict"])
-        value_module.load_state_dict(ckpt["value_state_dict"])
-        obs_norm = env.transform[0]
-        state_dict = ckpt["obsnorm_state_dict"]
-
-        obs_norm.loc = torch.nn.Parameter(
-            state_dict["loc"].clone(), requires_grad=False
-        )
-        obs_norm.scale = torch.nn.Parameter(
-            state_dict["scale"].clone(), requires_grad=False
-        )
-        # optim.load_state_dict(ckpt["optimizer_state_dict"])
-        # scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        # current_frame = ckpt.get("frame", 0)  # フレーム数の復元
-    else:
-        env.transform[0].init_stats(num_iter=1000, reduce_dim=0, cat_dim=0)
 
     return env
 
 
-env = make_env()
+def get_norm_stats():
+    test_env = make_env()
+    test_env.transform[0].init_stats(
+        num_iter=1000, reduce_dim=0, cat_dim=0
+    )
+    obs_norm_sd = test_env.transform[0].state_dict()
+    test_env.close()
+    del test_env
+    return obs_norm_sd
 
+def make_ppo_model(dummy_env):
+    actor_net = nn.Sequential(
+        nn.LazyLinear(num_cells, device=device),
+        nn.Tanh(),
+        nn.LazyLinear(num_cells, device=device),
+        nn.Tanh(),
+        nn.LazyLinear(num_cells, device=device),
+        nn.Tanh(),
+        nn.LazyLinear(2 * dummy_env.action_spec.shape[-1], device=device),
+        NormalParamExtractor(),
+    )
+
+    policy_module = TensorDictModule(
+        actor_net, in_keys=["observation"], out_keys=["loc", "scale"]
+    )
+    policy_module = ProbabilisticActor(
+        module=policy_module,
+        spec=dummy_env.action_spec,
+        in_keys=["loc", "scale"],
+        distribution_class=TanhNormal,
+        distribution_kwargs={
+            "low": dummy_env.action_spec.space.low,
+            "high": dummy_env.action_spec.space.high,
+        },
+        return_log_prob=True,
+        # we'll need the log-prob for the numerator of the importance weights
+    )
+
+    value_net = nn.Sequential(
+        nn.LazyLinear(num_cells, device=device),
+        nn.Tanh(),
+        nn.LazyLinear(num_cells, device=device),
+        nn.Tanh(),
+        nn.LazyLinear(num_cells, device=device),
+        nn.Tanh(),
+        nn.LazyLinear(1, device=device),
+    )
+    value_module = ValueOperator(
+        module=value_net,
+        in_keys=["observation"],
+    )
+
+    return policy_module, value_module
+
+def load_and_demo_model(model_dir):
+    dummy_stats = get_norm_stats()
+    env = make_env(render_mode="human", obs_norm_sd=dummy_stats)
+    policy_module, value_module = make_ppo_model(env)
+    # モデルデータ読み込み
+    ckpt = torch.load(model_dir / "best_model.pt", map_location=device)
+    policy_module.load_state_dict(ckpt["policy_state_dict"])
+    value_module.load_state_dict(ckpt["value_state_dict"])
+    obs_norm = env.transform[0]
+    obs_norm.load_state_dict(ckpt["obsnorm_state_dict"])
+    # optim.load_state_dict(ckpt["optimizer_state_dict"])
+    # scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    # current_frame = ckpt.get("frame", 0)  # フレーム数の復元
+
+    # 評価モードに切り替え
+    policy_module.eval()
+    value_module.eval()
+    obs_norm.eval()
+
+    return env, policy_module, value_module
+
+stats = get_norm_stats()
+env = make_env(obs_norm_sd=stats)
+policy_module, value_module = make_ppo_model(env)
 # print("-" * 50)
 # print("normalization constant shape:", env.transform[0].loc.shape)
 # print("-" * 50)
@@ -119,46 +203,6 @@ env = make_env()
 # print("Shape of the rollout TensorDict:", rollout.batch_size)
 # print("-" * 50)
 
-actor_net = nn.Sequential(
-    nn.LazyLinear(num_cells, device=device),
-    nn.Tanh(),
-    nn.LazyLinear(num_cells, device=device),
-    nn.Tanh(),
-    nn.LazyLinear(num_cells, device=device),
-    nn.Tanh(),
-    nn.LazyLinear(2 * env.action_spec.shape[-1], device=device),
-    NormalParamExtractor(),
-)
-
-policy_module = TensorDictModule(
-    actor_net, in_keys=["observation"], out_keys=["loc", "scale"]
-)
-policy_module = ProbabilisticActor(
-    module=policy_module,
-    spec=env.action_spec,
-    in_keys=["loc", "scale"],
-    distribution_class=TanhNormal,
-    distribution_kwargs={
-        "low": env.action_spec.space.low,
-        "high": env.action_spec.space.high,
-    },
-    return_log_prob=True,
-    # we'll need the log-prob for the numerator of the importance weights
-)
-
-value_net = nn.Sequential(
-    nn.LazyLinear(num_cells, device=device),
-    nn.Tanh(),
-    nn.LazyLinear(num_cells, device=device),
-    nn.Tanh(),
-    nn.LazyLinear(num_cells, device=device),
-    nn.Tanh(),
-    nn.LazyLinear(1, device=device),
-)
-value_module = ValueOperator(
-    module=value_net,
-    in_keys=["observation"],
-)
 
 print("Running policy:", policy_module(env.reset()))
 print("Running value:", value_module(env.reset()))
@@ -323,11 +367,7 @@ def train():
 # train()
 
 model_dir = Path("models") / "Ant-v4_Apr30_16-50-57"
-env = make_env(render_mode="human", load_and_eval=True)
-# 評価モードに切り替え
-policy_module.eval()
-value_module.eval()
-env.transform[0].eval()
+env, policy_module, _ = load_and_demo_model(model_dir)
 
 with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
     env.rollout(

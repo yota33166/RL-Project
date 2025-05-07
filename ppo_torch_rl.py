@@ -1,36 +1,55 @@
 #!/usr/bin/env python3
+import atexit
+import gc
+import signal
+import sys
+import tempfile
+import uuid
 import warnings
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Optional
 
-import matplotlib.pyplot as plt
 import torch
-from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
 from torch import multiprocessing, nn
-from torch.utils.tensorboard import SummaryWriter
-from torchrl.collectors import SyncDataCollector
-from torchrl.data.replay_buffers import ReplayBuffer
+from torch.multiprocessing import freeze_support
+from torchrl._utils import _CKPT_BACKEND
+from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
+from torchrl.data import LazyMemmapStorage
+from torchrl.data.replay_buffers import TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
-from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.envs import (
-    EnvCreator,
     Compose,
     DoubleToFloat,
+    EnvCreator,
     ObservationNorm,
     ParallelEnv,
     StepCounter,
     TransformedEnv,
 )
-from torchrl.envs.libs.gym import GymEnv, GymWrapper
-from torchrl.envs.utils import ExplorationType, check_env_specs, set_exploration_type
+from torchrl.envs.libs.gym import GymEnv
+from torchrl.envs.utils import (
+    ExplorationType,
+    TensorDict,
+    TensorDictBase,
+    check_env_specs,
+    set_exploration_type,
+)
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
-from torchrl.trainers import Trainer
-from tqdm import tqdm
+from torchrl.record.loggers.tensorboard import TensorboardLogger
+from torchrl.trainers import (
+    LogScalar,
+    LogValidationReward,
+    ReplayBufferTrainer,
+    Trainer,
+    TrainerHookBase,
+    UpdateWeights,
+)
+from torchrl.trainers.trainers import TrainerHookBase
 
 warnings.filterwarnings("ignore")
 
@@ -47,10 +66,12 @@ max_grad_norm = 1.0
 frames_per_batch = 1000
 # For a complete training, bring the number of frames up to 1M
 total_frames = 500_000
+buffer_size = min(100_000, total_frames)  # size of the replay buffer
 
 """ PPO parameters """
-sub_batch_size = 64  # cardinality of the sub-samples gathered from the current data in the inner loop
-num_epochs = 10  # optimization steps per batch of data collected
+# cardinality of the sub-samples gathered from the current data in the inner loop
+sub_batch_size = 64
+n_optim = 10  # optimization steps per batch of data collected
 clip_epsilon = (
     0.2  # clip value for PPO loss: see the equation in the intro for more context.
 )
@@ -59,10 +80,65 @@ lmbda = 0.95
 entropy_eps = 1e-4
 
 env_name = "Ant-v4"
+# num_workers = 1
+num_workers = multiprocessing.cpu_count() - 2  # number of workers for parallel envs
+num_collectors = num_workers  # number of collectors for parallel envs
 
-save_dir = Path(f"{env_name}_{datetime.now().strftime('%b%d_%H-%M-%S')}")
-log_dir = Path("logs") / save_dir
-model_dir = Path("models") / save_dir
+
+class SaveBestValidationReward(LogValidationReward):
+    def __init__(
+        self,
+        model_dir: str,
+        value_module: torch.nn.Module,
+        obs_norm,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.model_dir = Path(model_dir)
+        self.value_module = value_module
+        self.obs_norm = obs_norm
+        self.best_reward = -float("inf")
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+
+    @torch.inference_mode()
+    def __call__(self, batch: TensorDictBase) -> Dict:
+        metrics = super().__call__(batch)
+        if metrics is None:
+            return None
+        reward = metrics.get("r_evaluation", -float("inf"))
+        if reward is not None and reward > self.best_reward:
+            self.best_reward = reward
+            # モデルと正規化統計を保存
+            torch.save(
+                {
+                    "policy_state_dict": self.policy_exploration.state_dict(),
+                    "value_state_dict": self.value_module.state_dict(),
+                    "obsnorm_state_dict": self.obs_norm.state_dict(),
+                    "best_reward": self.best_reward,
+                },
+                self.model_dir / "best_model.pt",
+            )
+            self.trainer.logger.log_scalar("best_model_saved_at", self.best_reward)
+
+        return metrics
+
+    def state_dict(self):
+        base = super().state_dict()
+        base.update({"best_reward": self.best_reward})
+        return base
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.best_reward = state_dict.get("best_reward", -float("inf"))
+
+    def register(self, trainer: Trainer, name: str = "recorder"):
+        # Trainer インスタンスを保持
+        self.trainer = trainer
+        # モジュールとして登録
+        trainer.register_module(name, self)
+        # post_steps フックとして登録
+        trainer.register_op("post_steps_log", self)
+
 
 def env_maker(env_name, device, render_mode=None):
     env = GymEnv(
@@ -73,6 +149,7 @@ def env_maker(env_name, device, render_mode=None):
         render_mode=render_mode,
     )
     return env
+
 
 def make_env(
     parallel=False,
@@ -85,9 +162,14 @@ def make_env(
         obs_norm_sd = {"standard_normal": True}
 
     if parallel:
+        env_kwargs = {
+            "env_name": env_name,
+            "device": device,
+            "render_mode": render_mode,
+        }
         base_env = ParallelEnv(
             num_workers,
-            EnvCreator(maker),
+            EnvCreator(maker, env_kwargs),
             serial_for_single=True,
             mp_start_method=mp_context,
         )
@@ -108,13 +190,12 @@ def make_env(
 
 def get_norm_stats():
     test_env = make_env()
-    test_env.transform[0].init_stats(
-        num_iter=1000, reduce_dim=0, cat_dim=0
-    )
+    test_env.transform[0].init_stats(num_iter=1000, reduce_dim=0, cat_dim=0)
     obs_norm_sd = test_env.transform[0].state_dict()
     test_env.close()
     del test_env
     return obs_norm_sd
+
 
 def make_ppo_model(dummy_env):
     actor_net = nn.Sequential(
@@ -160,16 +241,17 @@ def make_ppo_model(dummy_env):
 
     return policy_module, value_module
 
+
 def load_and_demo_model(model_dir):
-    dummy_stats = get_norm_stats()
-    env = make_env(render_mode="human", obs_norm_sd=dummy_stats)
-    policy_module, value_module = make_ppo_model(env)
     # モデルデータ読み込み
     ckpt = torch.load(model_dir / "best_model.pt", map_location=device)
+
+    obs_norm = ckpt["obsnorm_state_dict"]
+
+    env = make_env(render_mode="human", obs_norm_sd=obs_norm)
+    policy_module, value_module = make_ppo_model(env)
     policy_module.load_state_dict(ckpt["policy_state_dict"])
     value_module.load_state_dict(ckpt["value_state_dict"])
-    obs_norm = env.transform[0]
-    obs_norm.load_state_dict(ckpt["obsnorm_state_dict"])
     # optim.load_state_dict(ckpt["optimizer_state_dict"])
     # scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     # current_frame = ckpt.get("frame", 0)  # フレーム数の復元
@@ -177,199 +259,219 @@ def load_and_demo_model(model_dir):
     # 評価モードに切り替え
     policy_module.eval()
     value_module.eval()
-    obs_norm.eval()
+    env.transform[0].eval()
 
-    return env, policy_module, value_module
-
-stats = get_norm_stats()
-env = make_env(obs_norm_sd=stats)
-policy_module, value_module = make_ppo_model(env)
-# print("-" * 50)
-# print("normalization constant shape:", env.transform[0].loc.shape)
-# print("-" * 50)
-# print("observation_spec:", env.observation_spec)
-# print("-" * 50)
-# print("reward_spec:", env.reward_spec)
-# print("-" * 50)
-# print("input_spec:", env.input_spec)
-# print("-" * 50)
-# print("action_spec (as defined by input_spec):", env.action_spec)
-# print("-" * 50)
-
-# check_env_specs(env)
-# print("-" * 50)
-# rollout = env.rollout(3)
-# print("rollout of three steps:", rollout)
-# print("Shape of the rollout TensorDict:", rollout.batch_size)
-# print("-" * 50)
-
-
-print("Running policy:", policy_module(env.reset()))
-print("Running value:", value_module(env.reset()))
-
-
-""" Data collector"""
-collector = SyncDataCollector(
-    env,
-    policy_module,
-    frames_per_batch=frames_per_batch,
-    total_frames=total_frames,
-    split_trajs=False,
-    device=device,
-)
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        env.rollout(
+            10000, policy_module, break_when_any_done=True
+        )  # 10000 ステップのロールアウトを実行
+    env.close()
+    del env, policy_module, value_module, obs_norm
 
 
 """ Replay buffer """
-replay_buffer = ReplayBuffer(
-    storage=LazyTensorStorage(max_size=frames_per_batch),
-    sampler=SamplerWithoutReplacement(),
-)
-
-""" Loss function """
-advantage_module = GAE(
-    gamma=gamma,
-    lmbda=lmbda,
-    value_network=value_module,
-    average_gae=True,
-    device=device,
-)
-
-loss_module = ClipPPOLoss(
-    actor_network=policy_module,
-    critic_network=value_module,
-    clip_epsilon=clip_epsilon,
-    entropy_bonus=bool(entropy_eps),
-    entropy_coef=entropy_eps,
-    # these keys match by default but we set this for completeness
-    critic_coef=1.0,
-    loss_critic_type="smooth_l1",
-)
-
-optim = torch.optim.Adam(loss_module.parameters(), lr)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optim, total_frames // frames_per_batch, 0.0
-)
-
-""" Training"""
 
 
-def train():
-    logs = defaultdict(list)
-    writer = SummaryWriter(log_dir=log_dir)
-    pbar = tqdm(total=total_frames)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    eval_str = ""
-    current_frame = 0
-    best_eval_reward = -float("inf")
-    # We iterate over the collector until it reaches the total number of frames it was
-    # designed to collect:
-    for i, tensordict_data in enumerate(collector):
-        # we now have a batch of data to work with. Let's learn something from it.
-        num_frames = (
-            tensordict_data.numel()
-        )  # tensordict_data に含まれるタイムステップ数
-        for _ in range(num_epochs):
-            # We'll need an "advantage" signal to make PPO work.
-            # We re-compute it at each epoch as its value depends on the value
-            # network which is updated in the inner loop.
-            advantage_module(tensordict_data)
-            data_view = tensordict_data.reshape(-1)
-            replay_buffer.extend(data_view.cpu())
-            for _ in range(frames_per_batch // sub_batch_size):
-                subdata = replay_buffer.sample(sub_batch_size)
-                loss_vals = loss_module(subdata.to(device))
-                loss_value = (
-                    loss_vals["loss_objective"]
-                    + loss_vals["loss_critic"]
-                    + loss_vals["loss_entropy"]
-                )
+def get_replay_buffer(buffer_size, n_optim, batch_size, device):
+    replay_buffer = TensorDictReplayBuffer(
+        batch_size=batch_size,
+        storage=LazyMemmapStorage(max_size=buffer_size, scratch_dir=buffer_scratch_dir),
+        prefetch=n_optim,
+        sampler=SamplerWithoutReplacement(),
+        transform=lambda td: td.to(device, non_blocking=True),
+    )
+    return replay_buffer
 
-                # Optimization: backward, grad clipping and optimization step
-                loss_value.backward()
-                # this is not strictly mandatory but it's good practice to keep
-                # your gradient norm bounded
-                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), max_grad_norm)
-                optim.step()
-                optim.zero_grad()
 
-        logs["reward"].append(tensordict_data["next", "reward"].mean().item())
-        pbar.update(num_frames)
-        current_frame += num_frames
-        logs["frames"].append(current_frame)
-        cum_reward_str = f"average reward=\
-            {logs['reward'][-1]: 4.4f} (init={logs['reward'][0]: 4.4f})"
-        logs["step_count"].append(tensordict_data["step_count"].max().item())
-        stepcount_str = f"step count (max): {logs['step_count'][-1]}"
-        logs["lr"].append(optim.param_groups[0]["lr"])
-        lr_str = f"lr policy: {logs['lr'][-1]: 4.4f}"
-        # TensorBoard に scalar 値を書き込み
-        writer.add_scalar("Loss/Total", loss_value.item(), i)
-        writer.add_scalar("Loss/Objective", loss_vals["loss_objective"].item(), i)
-        writer.add_scalar("Loss/Critic", loss_vals["loss_critic"].item(), i)
-        writer.add_scalar("Loss/Entropy", loss_vals["loss_entropy"].item(), i)
-        writer.add_scalar("Reward/BatchMean", logs["reward"][-1], i)
-        writer.add_scalar("StepCount/Max", logs["step_count"][-1], i)
-        writer.add_scalar("LearningRate", logs["lr"][-1], i)
-        if i % 10 == 0:
-            # We evaluate the policy once every 10 batches of data.
-            # Evaluation is rather simple: execute the policy without exploration
-            # (take the expected value of the action distribution) for a given
-            # number of steps (1000, which is our ``env`` horizon).
-            # The ``rollout`` method of the ``env`` can take a policy as argument:
-            # it will then execute this policy at each step.
-            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                # execute a rollout with the trained policy
-                eval_rollout = env.rollout(1000, policy_module)
-                eval_mean = eval_rollout["next", "reward"].mean().item()
-                logs["eval reward"].append(eval_mean)
-                logs["eval reward (sum)"].append(
-                    eval_rollout["next", "reward"].sum().item()
-                )
-                logs["eval step_count"].append(eval_rollout["step_count"].max().item())
-                eval_str = (
-                    f"eval cumulative reward: {logs['eval reward (sum)'][-1]: 4.4f} "
-                    f"(init: {logs['eval reward (sum)'][0]: 4.4f}), "
-                    f"eval step-count: {logs['eval step_count'][-1]}"
-                )
-                writer.add_scalar("Evaluation/RewardMean", logs["eval reward"][-1], i)
-                writer.add_scalar(
-                    "Evaluation/RewardSum", logs["eval reward (sum)"][-1], i
-                )
-                writer.add_scalar(
-                    "Evaluation/StepCountMax", logs["eval step_count"][-1], i
-                )
-                del eval_rollout
-            if eval_mean > best_eval_reward:
-                best_eval_reward = eval_mean
-                # 例: モデル、オプティマイザ、スケジューラをまとめて保存
-                torch.save(
-                    {
-                        "policy_state_dict": policy_module.state_dict(),
-                        "value_state_dict": value_module.state_dict(),
-                        "optimizer_state_dict": optim.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "obsnorm_state_dict": env.transform[0].state_dict(),
-                        "frame": current_frame,  # 任意で学習ステップ数など
-                    },
-                    model_dir / "best_model.pt",
-                )
-        pbar.set_description(
-            ", ".join([eval_str, cum_reward_str, stepcount_str, lr_str])
+""" Data collector"""
+
+
+def get_collector(
+    stats,
+    num_collectors,
+    policy,
+    frames_per_batch,
+    total_frames,
+    device,
+):
+    if is_fork:
+        collector_cls = SyncDataCollector
+        env_arg = make_env(parallel=True, obs_norm_sd=stats, num_workers=num_workers)
+    else:
+        collector_cls = MultiaSyncDataCollector
+        env_arg = [
+            make_env(parallel=True, obs_norm_sd=stats, num_workers=num_workers)
+        ] * num_collectors
+
+    data_collector = collector_cls(
+        env_arg,
+        policy=policy,
+        frames_per_batch=frames_per_batch,
+        total_frames=total_frames,
+        exploration_type=ExplorationType.RANDOM,
+        device=device,
+        storing_device=device,
+        split_trajs=False,
+        postproc=GAE(
+            gamma=gamma,
+            lmbda=lmbda,
+            value_network=value_module,
+            average_gae=True,
+            device=device,
+        ),
+    )
+    return data_collector
+
+
+def get_loss_module(
+    actor_network, critic_network, clip_epsilon=clip_epsilon, entropy_eps=entropy_eps
+):
+    loss_module = ClipPPOLoss(
+        actor_network=actor_network,
+        critic_network=critic_network,
+        clip_epsilon=clip_epsilon,
+        entropy_bonus=bool(entropy_eps),
+        entropy_coef=entropy_eps,
+        # these keys match by default but we set this for completeness
+        critic_coef=1.0,
+        loss_critic_type="smooth_l1",
+    )
+    return loss_module
+
+
+def cleanup_resources():
+    print("Cleaning up resources...")
+    try:
+        trainer.save_trainer(True)
+    except Exception as e:
+        print(f"Failed to save trainer: {e}")
+
+    try:
+        collector.shutdown()
+    except Exception as e:
+        print(f"Failed to shutdown collector: {e}")
+    try:
+        test_env.close()
+    except Exception as e:
+        print(f"Failed to close environment: {e}")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("Resources cleaned up.")
+
+
+def _signal_handler(signum, frame):
+    print(f"Signal {signum} received. Cleaning up resources...")
+    cleanup_resources()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    freeze_support()  # Windows の場合、マルチプロセスのために必要
+
+    exp_name = f"{env_name}_{uuid.uuid4().hex[:6]}"
+    buffer_scratch_dir = tempfile.TemporaryDirectory().name
+    save_dir = Path(f"ppo_{env_name}_{datetime.now().strftime('%b%d_%H-%M-%S')}")
+    log_dir = Path("logs") / save_dir
+    model_dir = Path("models") / save_dir
+
+    if _CKPT_BACKEND == "torchsnapshot":
+        save_trainer_file = (
+            model_dir / f"trainer_{datetime.now().strftime('%b%d_%H-%M-%S')}",
         )
+    elif _CKPT_BACKEND == "torch":
+        save_trainer_file = (
+            model_dir / f"trainer_{datetime.now().strftime('%b%d_%H-%M-%S')}.pt"
+        )
+    else:
+        raise ValueError(f"Unknown checkpoint backend: {_CKPT_BACKEND}")
 
-        # We're also using a learning rate scheduler. Like the gradient clipping,
-        # this is a nice-to-have but nothing necessary for PPO to work.
-        scheduler.step()
-    writer.close()
+    logger = TensorboardLogger(exp_name=exp_name, log_dir=log_dir)
+    log_interval = 1  # log interval for Tensorboard
 
+    stats = get_norm_stats()
+    test_env = make_env(obs_norm_sd=stats)
+    policy_module, value_module = make_ppo_model(test_env)
+    print("Running policy:", policy_module(test_env.reset()))
+    print("Running value:", value_module(test_env.reset()))
 
-# train()
+    loss_module = get_loss_module(
+        actor_network=policy_module,
+        critic_network=value_module,
+        clip_epsilon=clip_epsilon,
+        entropy_eps=entropy_eps,
+    )
+    collector = get_collector(
+        stats=stats,
+        num_collectors=num_collectors,
+        policy=policy_module,
+        frames_per_batch=frames_per_batch,
+        total_frames=total_frames,
+        device=device,
+    )
 
-model_dir = Path("models") / "Ant-v4_Apr30_16-50-57"
-env, policy_module, _ = load_and_demo_model(model_dir)
+    optim = torch.optim.Adam(loss_module.parameters(), lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optim, total_frames // frames_per_batch, 0.0
+    )
 
-with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-    env.rollout(
-        10000, policy_module, break_when_any_done=True
-    )  # 10000 ステップのロールアウトを実行
+    trainer = Trainer(
+        collector=collector,
+        total_frames=total_frames,
+        frame_skip=1,
+        loss_module=loss_module,
+        optimizer=optim,
+        logger=logger,
+        optim_steps_per_batch=n_optim,
+        log_interval=log_interval,
+    )
+
+    buffer_hook = ReplayBufferTrainer(
+        get_replay_buffer(
+            buffer_size, n_optim, batch_size=sub_batch_size, device=device
+        ),
+        flatten_tensordicts=True,
+    )
+    buffer_hook.register(trainer)
+    weight_updater = UpdateWeights(collector=collector, update_weights_interval=1)
+    weight_updater.register(trainer)
+    recorder = SaveBestValidationReward(
+        model_dir=model_dir,
+        value_module=value_module,
+        obs_norm=test_env.transform[0],
+        record_interval=100,  # log every 100 optimization steps
+        record_frames=1000,  # maximum number of frames in the record
+        frame_skip=1,
+        policy_exploration=policy_module,
+        environment=test_env,
+        exploration_type=ExplorationType.DETERMINISTIC,
+        log_keys=[("next", "reward")],
+        out_keys={("next", "reward"): "r_evaluation"},
+        log_pbar=True,
+    )
+    recorder.register(trainer)
+
+    trainer.register_op("post_optim", scheduler.step)
+
+    log_reward = LogScalar(log_pbar=True)
+    log_reward.register(trainer)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    """ Training"""
+    try:
+        trainer.train()
+        load_model = False
+        if load_model:
+            # Ant-v4_Apr30_16-50-57
+            # ppo_Ant-v4_May07_11-56-01
+            model_dir = Path("models") / "ppo_Ant-v4_May07_11-56-01"
+            load_and_demo_model(model_dir)
+        print("\nTraining completed successfully.")
+    except Exception as e:
+        print(f"Training failed: {e}")
+    finally:
+        cleanup_resources()
+        del trainer, collector, test_env

@@ -278,9 +278,7 @@ def load_and_demo_model(model_path):
 def get_replay_buffer(buffer_size, n_optim, batch_size, device):
     replay_buffer = TensorDictReplayBuffer(
         batch_size=batch_size,
-        storage=LazyMemmapStorage(
-            max_size=buffer_size, scratch_dir=buffer_scratch_dir
-        ),
+        storage=LazyMemmapStorage(max_size=buffer_size, scratch_dir=buffer_scratch_dir),
         prefetch=n_optim,
         sampler=SamplerWithoutReplacement(),
         transform=lambda td: td.to(device, non_blocking=True),
@@ -408,9 +406,7 @@ if __name__ == "__main__":
         # RL-Project\models\Ant-v4_Apr30_16-50-57\best_model.pt
         # RL-Project\models\ppo_Ant-v4_May07_16-00-19\model_tensor(0.9754).pt
         # model_data.pthRL-Project\models\
-        model_path = (
-            Path("models") / "model_1167.pt"
-        )
+        model_path = Path("models") / "model_1167.pt"
         load_and_demo_model(model_path)
         cleanup_resources()
         sys.exit(0)
@@ -475,13 +471,13 @@ if __name__ == "__main__":
         seed=SEED,
     )
     advantage_module = GAE(
-            gamma=gamma,
-            lmbda=lmbda,
-            value_network=value_module,
-            average_gae=True,
-            device=device,
-        )
-    
+        gamma=gamma,
+        lmbda=lmbda,
+        value_network=value_module,
+        average_gae=True,
+        device=device,
+    )
+
     trainer.register_op("batch_process", advantage_module)
     # batch_subsampler = BatchSubSampler(
     #     batch_size=sub_batch_size,

@@ -26,6 +26,7 @@ from torchrl.envs import (
     EnvCreator,
     ObservationNorm,
     ParallelEnv,
+    RewardScaling,
     StepCounter,
     TransformedEnv,
 )
@@ -42,6 +43,7 @@ from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torchrl.record.loggers.tensorboard import TensorboardLogger
 from torchrl.trainers import (
+    ClearCudaCache,
     LogScalar,
     LogValidationReward,
     ReplayBufferTrainer,
@@ -49,9 +51,10 @@ from torchrl.trainers import (
     TrainerHookBase,
     UpdateWeights,
 )
-from torchrl.trainers.trainers import TrainerHookBase
 
 warnings.filterwarnings("ignore")
+
+SEED = 42
 
 """ Define Hyperparameters """
 mp_context = multiprocessing.get_start_method()
@@ -60,17 +63,18 @@ device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork else
 
 num_cells = 256  # number of cells in each layer i.e. output dim.
 lr = 3e-4
+wd = 0.0  # weight decay
 max_grad_norm = 1.0
 
 """ Data collection parameters """
-frames_per_batch = 1000
+sub_batch_size = 64  # 512
+frames_per_batch = 1024  # 2048
 # For a complete training, bring the number of frames up to 1M
-total_frames = 500_000
-buffer_size = min(100_000, total_frames)  # size of the replay buffer
+total_frames = frames_per_batch * 1000  # total number of frames to collect
+buffer_size = min(409600, total_frames)  # size of the replay buffer
 
 """ PPO parameters """
 # cardinality of the sub-samples gathered from the current data in the inner loop
-sub_batch_size = 64
 n_optim = 10  # optimization steps per batch of data collected
 clip_epsilon = (
     0.2  # clip value for PPO loss: see the equation in the intro for more context.
@@ -79,10 +83,7 @@ gamma = 0.99
 lmbda = 0.95
 entropy_eps = 1e-4
 
-env_name = "Ant-v4"
-# num_workers = 1
-num_workers = multiprocessing.cpu_count() - 2  # number of workers for parallel envs
-num_collectors = num_workers  # number of collectors for parallel envs
+env_name = "InvertedDoublePendulum-v4"
 
 
 class SaveBestValidationReward(LogValidationReward):
@@ -90,13 +91,12 @@ class SaveBestValidationReward(LogValidationReward):
         self,
         model_dir: str,
         value_module: torch.nn.Module,
-        obs_norm,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.model_dir = Path(model_dir)
         self.value_module = value_module
-        self.obs_norm = obs_norm
+
         self.best_reward = -float("inf")
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -105,18 +105,19 @@ class SaveBestValidationReward(LogValidationReward):
         metrics = super().__call__(batch)
         if metrics is None:
             return None
-        reward = metrics.get("r_evaluation", -float("inf"))
+        reward = metrics.get("total_r_evaluation")
         if reward is not None and reward > self.best_reward:
             self.best_reward = reward
+            obs_norm = self.environment.transform[-1]
             # モデルと正規化統計を保存
             torch.save(
                 {
                     "policy_state_dict": self.policy_exploration.state_dict(),
                     "value_state_dict": self.value_module.state_dict(),
-                    "obsnorm_state_dict": self.obs_norm.state_dict(),
-                    "best_reward": self.best_reward,
+                    "obsnorm_state_dict": obs_norm.state_dict(),
+                    "reward": self.best_reward,
                 },
-                self.model_dir / "best_model.pt",
+                self.model_dir / f"model_{str(self.best_reward.item())}.pt",
             )
             self.trainer.logger.log_scalar("best_model_saved_at", self.best_reward)
 
@@ -161,6 +162,8 @@ def make_env(
     if obs_norm_sd is None:
         obs_norm_sd = {"standard_normal": True}
 
+    obs_norm_kwargs = obs_norm_sd.copy()
+
     if parallel:
         env_kwargs = {
             "env_name": env_name,
@@ -179,9 +182,10 @@ def make_env(
         base_env,
         Compose(
             # normalize observations
-            ObservationNorm(in_keys=["observation"], **obs_norm_sd),
-            DoubleToFloat(),
             StepCounter(),
+            DoubleToFloat(),
+            RewardScaling(loc=0.0, scale=1.0),
+            ObservationNorm(in_keys=["observation"], **obs_norm_kwargs),
         ),
     )
 
@@ -190,8 +194,8 @@ def make_env(
 
 def get_norm_stats():
     test_env = make_env()
-    test_env.transform[0].init_stats(num_iter=1000, reduce_dim=0, cat_dim=0)
-    obs_norm_sd = test_env.transform[0].state_dict()
+    test_env.transform[-1].init_stats(num_iter=1000, reduce_dim=0, cat_dim=0)
+    obs_norm_sd = test_env.transform[-1].state_dict()
     test_env.close()
     del test_env
     return obs_norm_sd
@@ -242,12 +246,11 @@ def make_ppo_model(dummy_env):
     return policy_module, value_module
 
 
-def load_and_demo_model(model_dir):
+def load_and_demo_model(model_path):
     # モデルデータ読み込み
-    ckpt = torch.load(model_dir / "best_model.pt", map_location=device)
+    ckpt = torch.load(model_path, map_location=device)
 
     obs_norm = ckpt["obsnorm_state_dict"]
-
     env = make_env(render_mode="human", obs_norm_sd=obs_norm)
     policy_module, value_module = make_ppo_model(env)
     policy_module.load_state_dict(ckpt["policy_state_dict"])
@@ -259,7 +262,7 @@ def load_and_demo_model(model_dir):
     # 評価モードに切り替え
     policy_module.eval()
     value_module.eval()
-    env.transform[0].eval()
+    env.transform[-1].eval()
 
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         env.rollout(
@@ -275,7 +278,9 @@ def load_and_demo_model(model_dir):
 def get_replay_buffer(buffer_size, n_optim, batch_size, device):
     replay_buffer = TensorDictReplayBuffer(
         batch_size=batch_size,
-        storage=LazyMemmapStorage(max_size=buffer_size, scratch_dir=buffer_scratch_dir),
+        storage=LazyMemmapStorage(
+            max_size=buffer_size, scratch_dir=buffer_scratch_dir
+        ),
         prefetch=n_optim,
         sampler=SamplerWithoutReplacement(),
         transform=lambda td: td.to(device, non_blocking=True),
@@ -290,6 +295,7 @@ def get_collector(
     stats,
     num_collectors,
     policy,
+    value_module,
     frames_per_batch,
     total_frames,
     device,
@@ -301,7 +307,8 @@ def get_collector(
         collector_cls = MultiaSyncDataCollector
         env_arg = [
             make_env(parallel=True, obs_norm_sd=stats, num_workers=num_workers)
-        ] * num_collectors
+            for _ in range(num_collectors)
+        ]
 
     data_collector = collector_cls(
         env_arg,
@@ -312,13 +319,6 @@ def get_collector(
         device=device,
         storing_device=device,
         split_trajs=False,
-        postproc=GAE(
-            gamma=gamma,
-            lmbda=lmbda,
-            value_network=value_module,
-            average_gae=True,
-            device=device,
-        ),
     )
     return data_collector
 
@@ -335,29 +335,59 @@ def get_loss_module(
         # these keys match by default but we set this for completeness
         critic_coef=1.0,
         loss_critic_type="smooth_l1",
+        normalize_advantage=True,
     )
     return loss_module
 
 
 def cleanup_resources():
+    global trainer, collector, test_env
+
     print("Cleaning up resources...")
     try:
-        trainer.save_trainer(True)
+        if "trainer" in globals() and trainer is not None:
+            print("Saving trainer...")
+            trainer.save_trainer(True)
     except Exception as e:
         print(f"Failed to save trainer: {e}")
 
     try:
-        collector.shutdown()
+        if "collector" in globals() and collector is not None:
+            print("Shutting down collector...")
+            if isinstance(collector, SyncDataCollector):
+                print("Shutting down collectors...")
+                collector.shutdown()
+            elif isinstance(collector, MultiaSyncDataCollector):
+                print(f"Shutting down {len(collector.collectors)} sub-collectors...")
+                for c in collector.collectors:
+                    c.shutdown()
     except Exception as e:
         print(f"Failed to shutdown collector: {e}")
+
     try:
-        test_env.close()
+        if "test_env" in globals() and test_env is not None:
+            test_env.close()
+            if isinstance(test_env, ParallelEnv):
+                if hasattr(test_env, "base_env"):
+                    print("Closing base environment...")
+                    test_env.base_env.close()
+
     except Exception as e:
         print(f"Failed to close environment: {e}")
 
+    try:
+        del trainer, collector, test_env
+    except Exception as e:
+        print(f"Failed to delete resources: {e}")
+
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        for i in range(torch.cuda.device_count()):
+            print(f"Cleaning up CUDA device {i}...")
+            with torch.cuda.device(i):
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
     print("Resources cleaned up.")
 
 
@@ -369,6 +399,21 @@ def _signal_handler(signum, frame):
 
 if __name__ == "__main__":
     freeze_support()  # Windows の場合、マルチプロセスのために必要
+    num_workers = 4
+    # num_workers = multiprocessing.cpu_count()  # number of workers for parallel envs
+    print(f"Number of workers: {num_workers}")
+    num_collectors = num_workers  # number of collectors for parallel envs
+    load_model = True
+    if load_model:
+        # RL-Project\models\Ant-v4_Apr30_16-50-57\best_model.pt
+        # RL-Project\models\ppo_Ant-v4_May07_16-00-19\model_tensor(0.9754).pt
+        # model_data.pthRL-Project\models\
+        model_path = (
+            Path("models") / "model_1167.pt"
+        )
+        load_and_demo_model(model_path)
+        cleanup_resources()
+        sys.exit(0)
 
     exp_name = f"{env_name}_{uuid.uuid4().hex[:6]}"
     buffer_scratch_dir = tempfile.TemporaryDirectory().name
@@ -406,12 +451,13 @@ if __name__ == "__main__":
         stats=stats,
         num_collectors=num_collectors,
         policy=policy_module,
+        value_module=value_module,
         frames_per_batch=frames_per_batch,
         total_frames=total_frames,
         device=device,
     )
 
-    optim = torch.optim.Adam(loss_module.parameters(), lr)
+    optim = torch.optim.Adam(loss_module.parameters(), lr=lr, weight_decay=wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optim, total_frames // frames_per_batch, 0.0
     )
@@ -425,22 +471,38 @@ if __name__ == "__main__":
         logger=logger,
         optim_steps_per_batch=n_optim,
         log_interval=log_interval,
+        clip_norm=max_grad_norm,
+        seed=SEED,
     )
+    advantage_module = GAE(
+            gamma=gamma,
+            lmbda=lmbda,
+            value_network=value_module,
+            average_gae=True,
+            device=device,
+        )
+    
+    trainer.register_op("batch_process", advantage_module)
+    # batch_subsampler = BatchSubSampler(
+    #     batch_size=sub_batch_size,
+    # )
+    # batch_subsampler.register(trainer)
 
     buffer_hook = ReplayBufferTrainer(
+        # PPOはオンポリシーアルゴリズムなので、buffer_sizeはframes_per_batchと同じ
         get_replay_buffer(
-            buffer_size, n_optim, batch_size=sub_batch_size, device=device
+            frames_per_batch, n_optim, batch_size=sub_batch_size, device=device
         ),
         flatten_tensordicts=True,
     )
     buffer_hook.register(trainer)
+
     weight_updater = UpdateWeights(collector=collector, update_weights_interval=1)
     weight_updater.register(trainer)
     recorder = SaveBestValidationReward(
         model_dir=model_dir,
         value_module=value_module,
-        obs_norm=test_env.transform[0],
-        record_interval=100,  # log every 100 optimization steps
+        record_interval=10,  # log every 100 optimization steps
         record_frames=1000,  # maximum number of frames in the record
         frame_skip=1,
         policy_exploration=policy_module,
@@ -457,21 +519,18 @@ if __name__ == "__main__":
     log_reward = LogScalar(log_pbar=True)
     log_reward.register(trainer)
 
+    clear_cuda = ClearCudaCache(100)
+    trainer.register_op("pre_optim_steps", clear_cuda)
+
+    atexit.register(cleanup_resources)
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
     """ Training"""
     try:
         trainer.train()
-        load_model = False
-        if load_model:
-            # Ant-v4_Apr30_16-50-57
-            # ppo_Ant-v4_May07_11-56-01
-            model_dir = Path("models") / "ppo_Ant-v4_May07_11-56-01"
-            load_and_demo_model(model_dir)
         print("\nTraining completed successfully.")
     except Exception as e:
         print(f"Training failed: {e}")
     finally:
         cleanup_resources()
-        del trainer, collector, test_env

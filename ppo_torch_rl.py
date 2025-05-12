@@ -6,11 +6,13 @@ import sys
 import tempfile
 import uuid
 import warnings
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
+import yaml
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
 from torch import multiprocessing, nn
@@ -33,9 +35,9 @@ from torchrl.envs import (
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.utils import (
     ExplorationType,
-    TensorDict,
+
     TensorDictBase,
-    check_env_specs,
+
     set_exploration_type,
 )
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
@@ -43,47 +45,65 @@ from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from torchrl.record.loggers.tensorboard import TensorboardLogger
 from torchrl.trainers import (
+    BatchSubSampler,
     ClearCudaCache,
     LogScalar,
     LogValidationReward,
-    ReplayBufferTrainer,
+
     Trainer,
-    TrainerHookBase,
+
     UpdateWeights,
 )
 
 warnings.filterwarnings("ignore")
 
-SEED = 42
+
+@dataclass
+class Config:
+    """Configuration class for the PPO agent."""
+
+    SEED = 42
+    num_workers: int = 4
+    env_name: str = "InvertedDoublePendulum-v4"
+    num_cells: int = 256
+    lr: float = 3e-4
+    wd: float = 0.0
+    max_grad_norm: float = 1.0
+
+    sub_batch_size: int = 64
+    frames_per_batch: int = 1024
+    total_frames: int = 1024000
+    buffer_size: int = 409600
+
+    n_optim: int = 10
+    clip_epsilon: float = 0.2
+    gamma: float = 0.99
+    lmbda: float = 0.95
+    entropy_eps: float = 1e-4
+
+    def __post_init__(self):
+        # buffer_size は total_frames に依存して決定
+        self.buffer_size = min(409_600, self.total_frames)
+
+    def save(self):
+        """設定を YAML ファイルに保存"""
+        with open("RLconfig.yaml", "w") as f:
+            yaml.safe_dump(asdict(self), f)
+
+    @classmethod
+    def load(cls, path: Path):
+        """既存設定ファイルから読み込み、新しいインスタンスを返す"""
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+        return cls(**data)
+
 
 """ Define Hyperparameters """
 mp_context = multiprocessing.get_start_method()
 is_fork = mp_context == "fork"
 device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork else "cpu")
 
-num_cells = 256  # number of cells in each layer i.e. output dim.
-lr = 3e-4
-wd = 0.0  # weight decay
-max_grad_norm = 1.0
-
-""" Data collection parameters """
-sub_batch_size = 64  # 512
-frames_per_batch = 1024  # 2048
-# For a complete training, bring the number of frames up to 1M
-total_frames = frames_per_batch * 1000  # total number of frames to collect
-buffer_size = min(409600, total_frames)  # size of the replay buffer
-
-""" PPO parameters """
-# cardinality of the sub-samples gathered from the current data in the inner loop
-n_optim = 10  # optimization steps per batch of data collected
-clip_epsilon = (
-    0.2  # clip value for PPO loss: see the equation in the intro for more context.
-)
-gamma = 0.99
-lmbda = 0.95
-entropy_eps = 1e-4
-
-env_name = "InvertedDoublePendulum-v4"
+cfg = Config()
 
 
 class SaveBestValidationReward(LogValidationReward):
@@ -117,7 +137,7 @@ class SaveBestValidationReward(LogValidationReward):
                     "obsnorm_state_dict": obs_norm.state_dict(),
                     "reward": self.best_reward,
                 },
-                self.model_dir / f"model_{str(self.best_reward.item())}.pt",
+                self.model_dir / f"best_model_{str(int(self.best_reward.item()))}.pt",
             )
             self.trainer.logger.log_scalar("best_model_saved_at", self.best_reward)
 
@@ -153,6 +173,7 @@ def env_maker(env_name, device, render_mode=None):
 
 
 def make_env(
+    env_name=cfg.env_name,
     parallel=False,
     obs_norm_sd=None,
     num_workers=1,
@@ -201,7 +222,7 @@ def get_norm_stats():
     return obs_norm_sd
 
 
-def make_ppo_model(dummy_env):
+def make_ppo_model(num_cells, dummy_env):
     actor_net = nn.Sequential(
         nn.LazyLinear(num_cells, device=device),
         nn.Tanh(),
@@ -252,7 +273,7 @@ def load_and_demo_model(model_path):
 
     obs_norm = ckpt["obsnorm_state_dict"]
     env = make_env(render_mode="human", obs_norm_sd=obs_norm)
-    policy_module, value_module = make_ppo_model(env)
+    policy_module, value_module = make_ppo_model(cfg.num_cells, env)
     policy_module.load_state_dict(ckpt["policy_state_dict"])
     value_module.load_state_dict(ckpt["value_state_dict"])
     # optim.load_state_dict(ckpt["optimizer_state_dict"])
@@ -321,9 +342,7 @@ def get_collector(
     return data_collector
 
 
-def get_loss_module(
-    actor_network, critic_network, clip_epsilon=clip_epsilon, entropy_eps=entropy_eps
-):
+def get_loss_module(actor_network, critic_network, clip_epsilon, entropy_eps):
     loss_module = ClipPPOLoss(
         actor_network=actor_network,
         critic_network=critic_network,
@@ -397,25 +416,28 @@ def _signal_handler(signum, frame):
 
 if __name__ == "__main__":
     freeze_support()  # Windows の場合、マルチプロセスのために必要
-    num_workers = 4
+    num_workers = cfg.num_workers
     # num_workers = multiprocessing.cpu_count()  # number of workers for parallel envs
     print(f"Number of workers: {num_workers}")
     num_collectors = num_workers  # number of collectors for parallel envs
-    load_model = True
+    load_model = False
     if load_model:
         # RL-Project\models\Ant-v4_Apr30_16-50-57\best_model.pt
         # RL-Project\models\ppo_Ant-v4_May07_16-00-19\model_tensor(0.9754).pt
         # model_data.pthRL-Project\models\
-        model_path = Path("models") / "model_1167.pt"
+        model_path = (
+            Path("models")
+            / "ppo_InvertedDoublePendulum-v4_May09_17-26-54\model_1558.pt"
+        )
         load_and_demo_model(model_path)
         cleanup_resources()
         sys.exit(0)
 
-    exp_name = f"{env_name}_{uuid.uuid4().hex[:6]}"
+    exp_name = f"{cfg.env_name}_{uuid.uuid4().hex[:6]}"
     buffer_scratch_dir = tempfile.TemporaryDirectory().name
-    save_dir = Path(f"ppo_{env_name}_{datetime.now().strftime('%b%d_%H-%M-%S')}")
-    log_dir = Path("logs") / save_dir
-    model_dir = Path("models") / save_dir
+    dir_name = Path(f"ppo_{cfg.env_name}_{datetime.now().strftime('%b%d_%H-%M-%S')}")
+    log_dir = Path("logs") / dir_name
+    model_dir = Path("models") / dir_name
 
     if _CKPT_BACKEND == "torchsnapshot":
         save_trainer_file = (
@@ -433,65 +455,68 @@ if __name__ == "__main__":
 
     stats = get_norm_stats()
     test_env = make_env(obs_norm_sd=stats)
-    policy_module, value_module = make_ppo_model(test_env)
+    policy_module, value_module = make_ppo_model(cfg.num_cells, test_env)
     print("Running policy:", policy_module(test_env.reset()))
     print("Running value:", value_module(test_env.reset()))
 
     loss_module = get_loss_module(
         actor_network=policy_module,
         critic_network=value_module,
-        clip_epsilon=clip_epsilon,
-        entropy_eps=entropy_eps,
+        clip_epsilon=cfg.clip_epsilon,
+        entropy_eps=cfg.entropy_eps,
     )
     collector = get_collector(
         stats=stats,
         num_collectors=num_collectors,
         policy=policy_module,
         value_module=value_module,
-        frames_per_batch=frames_per_batch,
-        total_frames=total_frames,
+        frames_per_batch=cfg.frames_per_batch,
+        total_frames=cfg.total_frames,
         device=device,
     )
 
-    optim = torch.optim.Adam(loss_module.parameters(), lr=lr, weight_decay=wd)
+    optim = torch.optim.Adam(loss_module.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optim, total_frames // frames_per_batch, 0.0
+        optim, cfg.total_frames // cfg.frames_per_batch, 0.0
     )
 
     trainer = Trainer(
         collector=collector,
-        total_frames=total_frames,
+        total_frames=cfg.total_frames,
         frame_skip=1,
         loss_module=loss_module,
         optimizer=optim,
         logger=logger,
-        optim_steps_per_batch=n_optim,
+        optim_steps_per_batch=cfg.n_optim,
         log_interval=log_interval,
-        clip_norm=max_grad_norm,
-        seed=SEED,
+        clip_norm=cfg.max_grad_norm,
+        seed=cfg.SEED,
     )
+    logger.log_hparams(asdict(cfg))
+
     advantage_module = GAE(
-        gamma=gamma,
-        lmbda=lmbda,
+        gamma=cfg.gamma,
+        lmbda=cfg.lmbda,
         value_network=value_module,
         average_gae=True,
         device=device,
     )
 
     trainer.register_op("batch_process", advantage_module)
-    # batch_subsampler = BatchSubSampler(
-    #     batch_size=sub_batch_size,
-    # )
-    # batch_subsampler.register(trainer)
-
-    buffer_hook = ReplayBufferTrainer(
-        # PPOはオンポリシーアルゴリズムなので、buffer_sizeはframes_per_batchと同じ
-        get_replay_buffer(
-            frames_per_batch, n_optim, batch_size=sub_batch_size, device=device
-        ),
-        flatten_tensordicts=True,
+    batch_subsampler = BatchSubSampler(
+        batch_size=cfg.sub_batch_size,
+        sub_traj_len=1,
     )
-    buffer_hook.register(trainer)
+    batch_subsampler.register(trainer)
+
+    # buffer_hook = ReplayBufferTrainer(
+    #     # PPOはオンポリシーアルゴリズムなので、buffer_sizeはframes_per_batchと同じ
+    #     get_replay_buffer(
+    #         frames_per_batch, n_optim, batch_size=sub_batch_size, device=device
+    #     ),
+    #     flatten_tensordicts=True,
+    # )
+    # buffer_hook.register(trainer)
 
     weight_updater = UpdateWeights(collector=collector, update_weights_interval=1)
     weight_updater.register(trainer)

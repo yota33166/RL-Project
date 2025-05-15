@@ -18,7 +18,7 @@ from tensordict.nn.distributions import NormalParamExtractor
 from torch import multiprocessing, nn
 from torch.multiprocessing import freeze_support
 from torchrl._utils import _CKPT_BACKEND
-from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
+from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyMemmapStorage
 from torchrl.data.replay_buffers import TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
@@ -33,13 +33,7 @@ from torchrl.envs import (
     TransformedEnv,
 )
 from torchrl.envs.libs.gym import GymEnv
-from torchrl.envs.utils import (
-    ExplorationType,
-
-    TensorDictBase,
-
-    set_exploration_type,
-)
+from torchrl.envs.utils import ExplorationType, TensorDictBase, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
@@ -49,11 +43,10 @@ from torchrl.trainers import (
     ClearCudaCache,
     LogScalar,
     LogValidationReward,
-
     Trainer,
-
     UpdateWeights,
 )
+from torchrl.trainers.trainers import TrainerHookBase
 
 warnings.filterwarnings("ignore")
 
@@ -61,29 +54,28 @@ warnings.filterwarnings("ignore")
 @dataclass
 class Config:
     """Configuration class for the PPO agent."""
-
+    memo: str = "n_optimを半分にして，reward scaleを0.01にした"
     SEED = 42
     num_workers: int = 4
-    env_name: str = "InvertedDoublePendulum-v4"
+    num_collectors: int = 2
+    env_name: str = "Humanoid-v4"
     num_cells: int = 256
     lr: float = 3e-4
     wd: float = 0.0
     max_grad_norm: float = 1.0
+    reward_scale: float = 0.01
 
     sub_batch_size: int = 64
     frames_per_batch: int = 1024
-    total_frames: int = 1024000
-    buffer_size: int = 409600
+    total_frames: int = 1_024_000
+    buffer_size: int = min(409_600, total_frames)
 
-    n_optim: int = 10
+    n_optim: int = 5
     clip_epsilon: float = 0.2
     gamma: float = 0.99
     lmbda: float = 0.95
     entropy_eps: float = 1e-4
-
-    def __post_init__(self):
-        # buffer_size は total_frames に依存して決定
-        self.buffer_size = min(409_600, self.total_frames)
+    critic_coef: float = 1.0
 
     def save(self):
         """設定を YAML ファイルに保存"""
@@ -101,8 +93,10 @@ class Config:
 """ Define Hyperparameters """
 mp_context = multiprocessing.get_start_method()
 is_fork = mp_context == "fork"
-device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork else "cpu")
 
+device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork else "cpu")
+print(f"Using device: {device}")
+print(f"Using multiprocessing context: {mp_context}")
 cfg = Config()
 
 
@@ -161,6 +155,25 @@ class SaveBestValidationReward(LogValidationReward):
         trainer.register_op("post_steps_log", self)
 
 
+class LogLearningRate(TrainerHookBase):
+    def __init__(self, optimizer, logger, log_interval=1, name="learning_rate"):
+        super().__init__()
+        self.optimizer = optimizer
+        self.logger = logger
+        self.log_interval = log_interval
+        self.name = name
+        self._step = 0
+
+    def __call__(self, *args, **kwargs):
+        self._step += 1
+        if self._step % self.log_interval == 0:
+            lr = self.optimizer.param_groups[0]["lr"]
+            self.logger.log_scalar(self.name, lr, step=self._step)
+
+    def register(self, trainer, name="log_lr"):
+        trainer.register_op("post_optim", self, name=name)
+
+
 def env_maker(env_name, device, render_mode=None):
     env = GymEnv(
         env_name=env_name,
@@ -205,7 +218,7 @@ def make_env(
             # normalize observations
             StepCounter(),
             DoubleToFloat(),
-            RewardScaling(loc=0.0, scale=1.0),
+            RewardScaling(loc=0.0, scale=cfg.reward_scale),
             ObservationNorm(in_keys=["observation"], **obs_norm_kwargs),
         ),
     )
@@ -322,12 +335,14 @@ def get_collector(
     if is_fork:
         collector_cls = SyncDataCollector
         env_arg = make_env(parallel=True, obs_norm_sd=stats, num_workers=num_workers)
+        print("Using SyncDataCollector")
     else:
-        collector_cls = MultiaSyncDataCollector
+        collector_cls = MultiSyncDataCollector
         env_arg = [
             make_env(parallel=True, obs_norm_sd=stats, num_workers=num_workers)
             for _ in range(num_collectors)
         ]
+        print("Using MultiSyncDataCollector")
 
     data_collector = collector_cls(
         env_arg,
@@ -350,7 +365,7 @@ def get_loss_module(actor_network, critic_network, clip_epsilon, entropy_eps):
         entropy_bonus=bool(entropy_eps),
         entropy_coef=entropy_eps,
         # these keys match by default but we set this for completeness
-        critic_coef=1.0,
+        critic_coef=cfg.critic_coef,
         loss_critic_type="smooth_l1",
         normalize_advantage=True,
     )
@@ -374,7 +389,7 @@ def cleanup_resources():
             if isinstance(collector, SyncDataCollector):
                 print("Shutting down collectors...")
                 collector.shutdown()
-            elif isinstance(collector, MultiaSyncDataCollector):
+            elif isinstance(collector, MultiSyncDataCollector):
                 print(f"Shutting down {len(collector.collectors)} sub-collectors...")
                 for c in collector.collectors:
                     c.shutdown()
@@ -419,7 +434,7 @@ if __name__ == "__main__":
     num_workers = cfg.num_workers
     # num_workers = multiprocessing.cpu_count()  # number of workers for parallel envs
     print(f"Number of workers: {num_workers}")
-    num_collectors = num_workers  # number of collectors for parallel envs
+    num_collectors = cfg.num_collectors  # number of collectors for parallel envs
     load_model = False
     if load_model:
         # RL-Project\models\Ant-v4_Apr30_16-50-57\best_model.pt
@@ -427,13 +442,13 @@ if __name__ == "__main__":
         # model_data.pthRL-Project\models\
         model_path = (
             Path("models")
-            / "ppo_InvertedDoublePendulum-v4_May09_17-26-54\model_1558.pt"
+            / "ppo_InvertedDoublePendulum-v4_May15_10-29-00\\best_model_93.pt"
         )
         load_and_demo_model(model_path)
         cleanup_resources()
         sys.exit(0)
 
-    exp_name = f"{cfg.env_name}_{uuid.uuid4().hex[:6]}"
+    exp_name = f"{uuid.uuid4().hex[:6]}"
     buffer_scratch_dir = tempfile.TemporaryDirectory().name
     dir_name = Path(f"ppo_{cfg.env_name}_{datetime.now().strftime('%b%d_%H-%M-%S')}")
     log_dir = Path("logs") / dir_name
@@ -452,12 +467,15 @@ if __name__ == "__main__":
 
     logger = TensorboardLogger(exp_name=exp_name, log_dir=log_dir)
     log_interval = 1  # log interval for Tensorboard
+    for key, value in asdict(cfg).items():
+        logger.experiment.add_text(key, str(value))
 
     stats = get_norm_stats()
     test_env = make_env(obs_norm_sd=stats)
     policy_module, value_module = make_ppo_model(cfg.num_cells, test_env)
-    print("Running policy:", policy_module(test_env.reset()))
-    print("Running value:", value_module(test_env.reset()))
+
+    print("policy", policy_module(test_env.reset()))
+    print("value", value_module(test_env.reset()))
 
     loss_module = get_loss_module(
         actor_network=policy_module,
@@ -492,7 +510,6 @@ if __name__ == "__main__":
         clip_norm=cfg.max_grad_norm,
         seed=cfg.SEED,
     )
-    logger.log_hparams(asdict(cfg))
 
     advantage_module = GAE(
         gamma=cfg.gamma,
@@ -535,10 +552,13 @@ if __name__ == "__main__":
     )
     recorder.register(trainer)
 
-    trainer.register_op("post_optim", scheduler.step)
+    trainer.register_op("post_steps", scheduler.step)
 
     log_reward = LogScalar(log_pbar=True)
     log_reward.register(trainer)
+
+    log_lr = LogLearningRate(optim, logger, log_interval=1)
+    log_lr.register(trainer)
 
     clear_cuda = ClearCudaCache(100)
     trainer.register_op("pre_optim_steps", clear_cuda)

@@ -3,14 +3,13 @@ import gc
 import sys
 import tempfile
 import warnings
-
-from pathlib import Path
 from typing import Dict
 
 import torch
-from torch import nn
+from config import Config
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
+from torch import nn
 from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyMemmapStorage
 from torchrl.data.replay_buffers import TensorDictReplayBuffer
@@ -29,12 +28,8 @@ from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.utils import ExplorationType, TensorDictBase, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
-from torchrl.trainers import (
-    LogValidationReward,
-    Trainer,
-)
+from torchrl.trainers import LogValidationReward, Trainer
 from torchrl.trainers.trainers import TrainerHookBase
-from config import Config
 
 warnings.filterwarnings("ignore")
 
@@ -113,7 +108,7 @@ class LogLearningRate(TrainerHookBase):
         trainer.register_op("post_optim", self, name=name)
 
 
-def env_maker(cfg:Config, device, render_mode=None):
+def env_maker(cfg: Config, device, render_mode=None):
     env = GymEnv(
         env_name=cfg.env.env_name,
         from_pixels=False,
@@ -175,7 +170,9 @@ def get_norm_stats(test_env):
 
 
 # TODO: MLPモジュールつかって上手いことやる（2025/05/21）
-def make_ppo_model(num_cells, dummy_env, device) -> tuple[ProbabilisticActor, ValueOperator]:
+def make_ppo_model(
+    num_cells, dummy_env, device
+) -> tuple[ProbabilisticActor, ValueOperator]:
     actor_net = nn.Sequential(
         nn.LazyLinear(num_cells, device=device),
         nn.Tanh(),
@@ -220,7 +217,7 @@ def make_ppo_model(num_cells, dummy_env, device) -> tuple[ProbabilisticActor, Va
     return policy_module, value_module
 
 
-def load_and_demo_model(cfg: Config, model_path:str, device):
+def load_and_demo_model(cfg: Config, model_path: str, device):
     # モデルデータ読み込み
     ckpt = torch.load(model_path, map_location=device)
 
@@ -248,6 +245,7 @@ def load_and_demo_model(cfg: Config, model_path:str, device):
 
 
 """ Replay buffer """
+
 
 def get_replay_buffer(buffer_size, n_optim, batch_size, device):
     replay_buffer = TensorDictReplayBuffer(

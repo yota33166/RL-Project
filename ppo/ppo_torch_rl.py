@@ -3,19 +3,15 @@ import atexit
 import multiprocessing
 import signal
 import sys
-import tempfile
-import uuid
 import warnings
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 import torch
-
+from config import Config
 from torch.multiprocessing import freeze_support
 from torchrl._utils import _CKPT_BACKEND
-
-
 from torchrl.envs.utils import ExplorationType
 from torchrl.objectives.value import GAE
 from torchrl.record.loggers.tensorboard import TensorboardLogger
@@ -26,29 +22,29 @@ from torchrl.trainers import (
     Trainer,
     UpdateWeights,
 )
-from config import Config
 from utils import (
-    SaveBestValidationReward,
     LogLearningRate,
+    SaveBestValidationReward,
+    _signal_handler,
+    cleanup_resources,
     get_collector,
     get_loss_module,
     get_norm_stats,
+    load_and_demo_model,
     make_env,
     make_ppo_model,
-    load_and_demo_model,
-    cleanup_resources,
-    _signal_handler,
 )
 
 warnings.filterwarnings("ignore")
-
 
 
 if __name__ == "__main__":
     mp_context = multiprocessing.get_start_method()
     is_fork = mp_context == "fork"
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork else "cpu")
+    device = torch.device(
+        "cuda:0" if torch.cuda.is_available() and not is_fork else "cpu"
+    )
     print(f"Using device: {device}")
     print(f"Using multiprocessing context: {mp_context}")
     cfg = Config()
@@ -57,9 +53,12 @@ if __name__ == "__main__":
     num_workers = cfg.env.num_workers
     # num_workers = multiprocessing.cpu_count()  # number of workers for parallel envs
     print(f"Number of workers: {num_workers}")
-    num_collectors = cfg.collector.env_per_collector  # number of collectors for parallel envs
-    load_model = False
-    if load_model:
+    num_collectors = (
+        cfg.collector.env_per_collector
+    )  # number of collectors for parallel envs
+    print(f"Number of collectors: {num_collectors}")
+
+    if cfg.load_model:
         # ppo_InvertedDoublePendulum-v4_May15_10-29-00\best_model_93.pt
         model_path = (
             Path("models")
@@ -68,9 +67,6 @@ if __name__ == "__main__":
         load_and_demo_model(cfg, model_path, device)
         cleanup_resources()
         sys.exit(0)
-
-    exp_name = f"{uuid.uuid4().hex[:6]}"
-    buffer_scratch_dir = tempfile.TemporaryDirectory().name
 
     if _CKPT_BACKEND == "torchsnapshot":
         save_trainer_file = (
@@ -90,10 +86,7 @@ if __name__ == "__main__":
 
     test_env = make_env(cfg, device=device)
     stats = get_norm_stats(test_env)
-    test_env = make_env(cfg,
-                        device=device,
-                        mp_context=mp_context,
-                        obs_norm_sd=stats)
+    test_env = make_env(cfg, device=device, mp_context=mp_context, obs_norm_sd=stats)
     policy_module, value_module = make_ppo_model(cfg.optim.num_cells, test_env, device)
 
     print("policy", policy_module(test_env.reset()))
@@ -101,12 +94,6 @@ if __name__ == "__main__":
 
     dummy_td = test_env.reset()
     obs = dummy_td["observation"]
-
-    # モデルのグラフを記録
-    # --- ProbabilisticActor/TensorDictModule を避けて内部 nn.Sequential をトレース ---
-    # TensorDictModule(module=actor_net) の下層にある actor_net (nn.Sequential) を取得
-    logger.experiment.add_graph(policy_module.module[0].module, (obs,))
-    logger.experiment.add_graph(value_module.module, (obs,))
 
     loss_module = get_loss_module(
         cfg,
@@ -121,7 +108,9 @@ if __name__ == "__main__":
         device=device,
     )
 
-    optim = torch.optim.Adam(loss_module.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.wd)
+    optim = torch.optim.Adam(
+        loss_module.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.wd
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optim, cfg.collector.total_frames // cfg.collector.frames_per_batch, 0.0
     )
@@ -168,8 +157,8 @@ if __name__ == "__main__":
     recorder = SaveBestValidationReward(
         cfg=cfg,
         value_module=value_module,
-        record_interval=10,  # log every 100 optimization steps
-        record_frames=cfg.env.max_episode_steps,  # maximum number of frames in the record
+        record_interval=10,
+        record_frames=cfg.env.max_episode_steps,
         frame_skip=1,
         policy_exploration=policy_module,
         environment=test_env,

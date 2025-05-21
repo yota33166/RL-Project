@@ -11,6 +11,7 @@ class EnvConfig:
     num_workers: int = 4
     reward_scale: float = 0.01
     max_episode_steps: int = 1000
+    frame_skip: int = 1
     seed: int = 42
 
 
@@ -50,7 +51,8 @@ class LossConfig:
 class LogConfig:
     """Configuration class for logging."""
 
-    log_interval: int = 1
+    tb_log_interval: int = 1
+    val_record_interval: int = 10
     exp_name: str = f"ppo_{uuid.uuid4().hex[:6]}"
     log_dir: Path = Path("logs") / exp_name
     model_dir: Path = log_dir / "models"

@@ -34,11 +34,16 @@ from utils import (
     make_env,
     make_ppo_model,
 )
+from omegaconf import OmegaConf
+import hydra
 
 warnings.filterwarnings("ignore")
 
 
-if __name__ == "__main__":
+# @hydra.main(config_path="configs/", config_name="config")
+def main(cfg: Config) -> None:
+    print(OmegaConf.to_yaml(cfg))
+
     mp_context = multiprocessing.get_start_method()
     is_fork = mp_context == "fork"
 
@@ -70,17 +75,20 @@ if __name__ == "__main__":
 
     if _CKPT_BACKEND == "torchsnapshot":
         save_trainer_file = (
-            cfg.log.model_dir / f"trainer_{datetime.now().strftime('%b%d_%H-%M-%S')}",
+            cfg.log.model_dir
+            / "trainer"
+            / f"{datetime.now().strftime('%b%d_%H-%M-%S')}",
         )
     elif _CKPT_BACKEND == "torch":
         save_trainer_file = (
-            cfg.log.model_dir / f"trainer_{datetime.now().strftime('%b%d_%H-%M-%S')}.pt"
+            cfg.log.model_dir
+            / "trainer"
+            / f"{datetime.now().strftime('%b%d_%H-%M-%S')}.pt"
         )
     else:
         raise ValueError(f"Unknown checkpoint backend: {_CKPT_BACKEND}")
 
     logger = TensorboardLogger(exp_name=cfg.log.exp_name, log_dir=cfg.log.log_dir)
-    log_interval = 1  # log interval for Tensorboard
     for key, value in asdict(cfg).items():
         logger.experiment.add_text(key, str(value))
 
@@ -91,9 +99,6 @@ if __name__ == "__main__":
 
     print("policy", policy_module(test_env.reset()))
     print("value", value_module(test_env.reset()))
-
-    dummy_td = test_env.reset()
-    obs = dummy_td["observation"]
 
     loss_module = get_loss_module(
         cfg,
@@ -118,14 +123,15 @@ if __name__ == "__main__":
     trainer = Trainer(
         collector=collector,
         total_frames=cfg.collector.total_frames,
-        frame_skip=1,
+        frame_skip=cfg.env.frame_skip,
         loss_module=loss_module,
         optimizer=optim,
         logger=logger,
         optim_steps_per_batch=cfg.loss.n_optim,
-        log_interval=log_interval,
+        log_interval=cfg.log.tb_log_interval,
         clip_norm=cfg.optim.max_grad_norm,
         seed=cfg.env.seed,
+        save_trainer_file=save_trainer_file,
     )
 
     advantage_module = GAE(
@@ -157,9 +163,9 @@ if __name__ == "__main__":
     recorder = SaveBestValidationReward(
         cfg=cfg,
         value_module=value_module,
-        record_interval=10,
+        record_interval=cfg.log.val_record_interval,
         record_frames=cfg.env.max_episode_steps,
-        frame_skip=1,
+        frame_skip=cfg.env.frame_skip,
         policy_exploration=policy_module,
         environment=test_env,
         exploration_type=ExplorationType.DETERMINISTIC,
@@ -174,7 +180,7 @@ if __name__ == "__main__":
     log_reward = LogScalar(log_pbar=True)
     log_reward.register(trainer)
 
-    log_lr = LogLearningRate(optim, logger, log_interval=1)
+    log_lr = LogLearningRate(optim, logger, log_interval=cfg.log.tb_log_interval)
     log_lr.register(trainer)
 
     clear_cuda = ClearCudaCache(100)
@@ -192,3 +198,7 @@ if __name__ == "__main__":
         print(f"Training failed: {e}")
     finally:
         cleanup_resources()
+
+
+if __name__ == "__main__":
+    main()

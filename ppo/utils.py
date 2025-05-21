@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
-import atexit
 import gc
-import signal
 import sys
 import tempfile
-import uuid
 import warnings
-from dataclasses import asdict, dataclass
-from datetime import datetime
+
 from pathlib import Path
 from typing import Dict
 
 import torch
-import yaml
+from torch import nn
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
-from torch import multiprocessing, nn
-from torch.multiprocessing import freeze_support
-from torchrl._utils import _CKPT_BACKEND
 from torchrl.collectors import MultiSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyMemmapStorage
 from torchrl.data.replay_buffers import TensorDictReplayBuffer
@@ -36,79 +29,25 @@ from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.utils import ExplorationType, TensorDictBase, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
-from torchrl.objectives.value import GAE
-from torchrl.record.loggers.tensorboard import TensorboardLogger
 from torchrl.trainers import (
-    BatchSubSampler,
-    ClearCudaCache,
-    LogScalar,
     LogValidationReward,
     Trainer,
-    UpdateWeights,
 )
 from torchrl.trainers.trainers import TrainerHookBase
+from config import Config
 
 warnings.filterwarnings("ignore")
-
-
-@dataclass
-class Config:
-    """Configuration class for the PPO agent."""
-    memo: str = "n_optimを半分にして，reward scaleを0.01にした"
-    SEED = 42
-    num_workers: int = 4
-    num_collectors: int = 2
-    env_name: str = "Humanoid-v4"
-    num_cells: int = 256
-    lr: float = 3e-4
-    wd: float = 0.0
-    max_grad_norm: float = 1.0
-    reward_scale: float = 0.01
-
-    sub_batch_size: int = 64
-    frames_per_batch: int = 1024
-    total_frames: int = 1_024_000
-    buffer_size: int = min(409_600, total_frames)
-
-    n_optim: int = 5
-    clip_epsilon: float = 0.2
-    gamma: float = 0.99
-    lmbda: float = 0.95
-    entropy_eps: float = 1e-4
-    critic_coef: float = 1.0
-
-    def save(self):
-        """設定を YAML ファイルに保存"""
-        with open("RLconfig.yaml", "w") as f:
-            yaml.safe_dump(asdict(self), f)
-
-    @classmethod
-    def load(cls, path: Path):
-        """既存設定ファイルから読み込み、新しいインスタンスを返す"""
-        with open(path, "r") as f:
-            data = yaml.safe_load(f)
-        return cls(**data)
-
-
-""" Define Hyperparameters """
-mp_context = multiprocessing.get_start_method()
-is_fork = mp_context == "fork"
-
-device = torch.device("cuda:0" if torch.cuda.is_available() and not is_fork else "cpu")
-print(f"Using device: {device}")
-print(f"Using multiprocessing context: {mp_context}")
-cfg = Config()
 
 
 class SaveBestValidationReward(LogValidationReward):
     def __init__(
         self,
-        model_dir: str,
+        cfg: Config,
         value_module: torch.nn.Module,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.model_dir = Path(model_dir)
+        self.model_dir = cfg.log.model_dir
         self.value_module = value_module
 
         self.best_reward = -float("inf")
@@ -174,9 +113,9 @@ class LogLearningRate(TrainerHookBase):
         trainer.register_op("post_optim", self, name=name)
 
 
-def env_maker(env_name, device, render_mode=None):
+def env_maker(cfg:Config, device, render_mode=None):
     env = GymEnv(
-        env_name=env_name,
+        env_name=cfg.env.env_name,
         from_pixels=False,
         pixels_only=False,
         device=device,
@@ -186,10 +125,11 @@ def env_maker(env_name, device, render_mode=None):
 
 
 def make_env(
-    env_name=cfg.env_name,
+    cfg: Config,
+    device,
+    mp_context=None,
     parallel=False,
     obs_norm_sd=None,
-    num_workers=1,
     maker=env_maker,
     render_mode=None,
 ):
@@ -200,25 +140,25 @@ def make_env(
 
     if parallel:
         env_kwargs = {
-            "env_name": env_name,
+            "cfg": cfg,
             "device": device,
             "render_mode": render_mode,
         }
         base_env = ParallelEnv(
-            num_workers,
+            cfg.env.num_workers,
             EnvCreator(maker, env_kwargs),
             serial_for_single=True,
             mp_start_method=mp_context,
         )
     else:
-        base_env = env_maker(env_name, device, render_mode=render_mode)
+        base_env = env_maker(cfg, device, render_mode=render_mode)
     env = TransformedEnv(
         base_env,
         Compose(
             # normalize observations
             StepCounter(),
             DoubleToFloat(),
-            RewardScaling(loc=0.0, scale=cfg.reward_scale),
+            RewardScaling(loc=0.0, scale=cfg.env.reward_scale),
             ObservationNorm(in_keys=["observation"], **obs_norm_kwargs),
         ),
     )
@@ -226,8 +166,7 @@ def make_env(
     return env
 
 
-def get_norm_stats():
-    test_env = make_env()
+def get_norm_stats(test_env):
     test_env.transform[-1].init_stats(num_iter=1000, reduce_dim=0, cat_dim=0)
     obs_norm_sd = test_env.transform[-1].state_dict()
     test_env.close()
@@ -235,7 +174,8 @@ def get_norm_stats():
     return obs_norm_sd
 
 
-def make_ppo_model(num_cells, dummy_env):
+# TODO: MLPモジュールつかって上手いことやる（2025/05/21）
+def make_ppo_model(num_cells, dummy_env, device) -> tuple[ProbabilisticActor, ValueOperator]:
     actor_net = nn.Sequential(
         nn.LazyLinear(num_cells, device=device),
         nn.Tanh(),
@@ -280,7 +220,7 @@ def make_ppo_model(num_cells, dummy_env):
     return policy_module, value_module
 
 
-def load_and_demo_model(model_path):
+def load_and_demo_model(cfg: Config, model_path:str, device):
     # モデルデータ読み込み
     ckpt = torch.load(model_path, map_location=device)
 
@@ -299,20 +239,20 @@ def load_and_demo_model(model_path):
     env.transform[-1].eval()
 
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-        env.rollout(
-            10000, policy_module, break_when_any_done=True
-        )  # 10000 ステップのロールアウトを実行
+        for _ in range(10):
+            env.rollout(
+                1000, policy_module, break_when_any_done=True
+            )  # 10000 ステップのロールアウトを実行
     env.close()
     del env, policy_module, value_module, obs_norm
 
 
 """ Replay buffer """
 
-
 def get_replay_buffer(buffer_size, n_optim, batch_size, device):
     replay_buffer = TensorDictReplayBuffer(
         batch_size=batch_size,
-        storage=LazyMemmapStorage(max_size=buffer_size, scratch_dir=buffer_scratch_dir),
+        storage=LazyMemmapStorage(max_size=buffer_size, scratch_dir=tempfile.mkdtemp()),
         prefetch=n_optim,
         sampler=SamplerWithoutReplacement(),
         transform=lambda td: td.to(device, non_blocking=True),
@@ -324,31 +264,29 @@ def get_replay_buffer(buffer_size, n_optim, batch_size, device):
 
 
 def get_collector(
+    cfg: Config,
+    mp_context,
     stats,
-    num_collectors,
     policy,
-    value_module,
-    frames_per_batch,
-    total_frames,
     device,
 ):
-    if is_fork:
+    if mp_context == "fork":
         collector_cls = SyncDataCollector
-        env_arg = make_env(parallel=True, obs_norm_sd=stats, num_workers=num_workers)
+        env_arg = make_env(cfg, device, parallel=True, obs_norm_sd=stats)
         print("Using SyncDataCollector")
     else:
         collector_cls = MultiSyncDataCollector
         env_arg = [
-            make_env(parallel=True, obs_norm_sd=stats, num_workers=num_workers)
-            for _ in range(num_collectors)
+            make_env(cfg, device, parallel=True, obs_norm_sd=stats)
+            for _ in range(cfg.collector.env_per_collector)
         ]
         print("Using MultiSyncDataCollector")
 
     data_collector = collector_cls(
         env_arg,
         policy=policy,
-        frames_per_batch=frames_per_batch,
-        total_frames=total_frames,
+        frames_per_batch=cfg.collector.frames_per_batch,
+        total_frames=cfg.collector.total_frames,
         exploration_type=ExplorationType.RANDOM,
         device=device,
         storing_device=device,
@@ -357,15 +295,15 @@ def get_collector(
     return data_collector
 
 
-def get_loss_module(actor_network, critic_network, clip_epsilon, entropy_eps):
+def get_loss_module(cfg: Config, actor_network, critic_network):
     loss_module = ClipPPOLoss(
         actor_network=actor_network,
         critic_network=critic_network,
-        clip_epsilon=clip_epsilon,
-        entropy_bonus=bool(entropy_eps),
-        entropy_coef=entropy_eps,
+        clip_epsilon=cfg.loss.clip_epsilon,
+        entropy_bonus=bool(cfg.loss.entropy_eps),
+        entropy_coef=cfg.loss.entropy_eps,
         # these keys match by default but we set this for completeness
-        critic_coef=cfg.critic_coef,
+        critic_coef=cfg.loss.critic_coef,
         loss_critic_type="smooth_l1",
         normalize_advantage=True,
     )
@@ -427,151 +365,3 @@ def _signal_handler(signum, frame):
     print(f"Signal {signum} received. Cleaning up resources...")
     cleanup_resources()
     sys.exit(0)
-
-
-if __name__ == "__main__":
-    freeze_support()  # Windows の場合、マルチプロセスのために必要
-    num_workers = cfg.num_workers
-    # num_workers = multiprocessing.cpu_count()  # number of workers for parallel envs
-    print(f"Number of workers: {num_workers}")
-    num_collectors = cfg.num_collectors  # number of collectors for parallel envs
-    load_model = False
-    if load_model:
-        # RL-Project\models\Ant-v4_Apr30_16-50-57\best_model.pt
-        # RL-Project\models\ppo_Ant-v4_May07_16-00-19\model_tensor(0.9754).pt
-        # model_data.pthRL-Project\models\
-        model_path = (
-            Path("models")
-            / "ppo_InvertedDoublePendulum-v4_May15_10-29-00\\best_model_93.pt"
-        )
-        load_and_demo_model(model_path)
-        cleanup_resources()
-        sys.exit(0)
-
-    exp_name = f"{uuid.uuid4().hex[:6]}"
-    buffer_scratch_dir = tempfile.TemporaryDirectory().name
-    dir_name = Path(f"ppo_{cfg.env_name}_{datetime.now().strftime('%b%d_%H-%M-%S')}")
-    log_dir = Path("logs") / dir_name
-    model_dir = Path("models") / dir_name
-
-    if _CKPT_BACKEND == "torchsnapshot":
-        save_trainer_file = (
-            model_dir / f"trainer_{datetime.now().strftime('%b%d_%H-%M-%S')}",
-        )
-    elif _CKPT_BACKEND == "torch":
-        save_trainer_file = (
-            model_dir / f"trainer_{datetime.now().strftime('%b%d_%H-%M-%S')}.pt"
-        )
-    else:
-        raise ValueError(f"Unknown checkpoint backend: {_CKPT_BACKEND}")
-
-    logger = TensorboardLogger(exp_name=exp_name, log_dir=log_dir)
-    log_interval = 1  # log interval for Tensorboard
-    for key, value in asdict(cfg).items():
-        logger.experiment.add_text(key, str(value))
-
-    stats = get_norm_stats()
-    test_env = make_env(obs_norm_sd=stats)
-    policy_module, value_module = make_ppo_model(cfg.num_cells, test_env)
-
-    print("policy", policy_module(test_env.reset()))
-    print("value", value_module(test_env.reset()))
-
-    loss_module = get_loss_module(
-        actor_network=policy_module,
-        critic_network=value_module,
-        clip_epsilon=cfg.clip_epsilon,
-        entropy_eps=cfg.entropy_eps,
-    )
-    collector = get_collector(
-        stats=stats,
-        num_collectors=num_collectors,
-        policy=policy_module,
-        value_module=value_module,
-        frames_per_batch=cfg.frames_per_batch,
-        total_frames=cfg.total_frames,
-        device=device,
-    )
-
-    optim = torch.optim.Adam(loss_module.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optim, cfg.total_frames // cfg.frames_per_batch, 0.0
-    )
-
-    trainer = Trainer(
-        collector=collector,
-        total_frames=cfg.total_frames,
-        frame_skip=1,
-        loss_module=loss_module,
-        optimizer=optim,
-        logger=logger,
-        optim_steps_per_batch=cfg.n_optim,
-        log_interval=log_interval,
-        clip_norm=cfg.max_grad_norm,
-        seed=cfg.SEED,
-    )
-
-    advantage_module = GAE(
-        gamma=cfg.gamma,
-        lmbda=cfg.lmbda,
-        value_network=value_module,
-        average_gae=True,
-        device=device,
-    )
-
-    trainer.register_op("batch_process", advantage_module)
-    batch_subsampler = BatchSubSampler(
-        batch_size=cfg.sub_batch_size,
-        sub_traj_len=1,
-    )
-    batch_subsampler.register(trainer)
-
-    # buffer_hook = ReplayBufferTrainer(
-    #     # PPOはオンポリシーアルゴリズムなので、buffer_sizeはframes_per_batchと同じ
-    #     get_replay_buffer(
-    #         frames_per_batch, n_optim, batch_size=sub_batch_size, device=device
-    #     ),
-    #     flatten_tensordicts=True,
-    # )
-    # buffer_hook.register(trainer)
-
-    weight_updater = UpdateWeights(collector=collector, update_weights_interval=1)
-    weight_updater.register(trainer)
-    recorder = SaveBestValidationReward(
-        model_dir=model_dir,
-        value_module=value_module,
-        record_interval=10,  # log every 100 optimization steps
-        record_frames=1000,  # maximum number of frames in the record
-        frame_skip=1,
-        policy_exploration=policy_module,
-        environment=test_env,
-        exploration_type=ExplorationType.DETERMINISTIC,
-        log_keys=[("next", "reward")],
-        out_keys={("next", "reward"): "r_evaluation"},
-        log_pbar=True,
-    )
-    recorder.register(trainer)
-
-    trainer.register_op("post_steps", scheduler.step)
-
-    log_reward = LogScalar(log_pbar=True)
-    log_reward.register(trainer)
-
-    log_lr = LogLearningRate(optim, logger, log_interval=1)
-    log_lr.register(trainer)
-
-    clear_cuda = ClearCudaCache(100)
-    trainer.register_op("pre_optim_steps", clear_cuda)
-
-    atexit.register(cleanup_resources)
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
-    """ Training"""
-    try:
-        trainer.train()
-        print("\nTraining completed successfully.")
-    except Exception as e:
-        print(f"Training failed: {e}")
-    finally:
-        cleanup_resources()

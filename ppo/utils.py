@@ -25,11 +25,13 @@ from torchrl.envs import (
     TransformedEnv,
 )
 from torchrl.envs.libs.gym import GymEnv
-from torchrl.envs.utils import ExplorationType, TensorDictBase, set_exploration_type
+from torchrl.envs.utils import ExplorationType, TensorDict, TensorDictBase, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
 from torchrl.trainers import LogValidationReward, Trainer
 from torchrl.trainers.trainers import TrainerHookBase
+
+import pandas as pd
 
 warnings.filterwarnings("ignore")
 
@@ -217,13 +219,13 @@ def make_ppo_model(
     return policy_module, value_module
 
 
-def load_and_demo_model(cfg: Config, model_path: str, device):
+def load_and_demo_model(cfg: Config, model_path: str, device, iteration: int = 1):
     # モデルデータ読み込み
     ckpt = torch.load(model_path, map_location=device)
 
     obs_norm = ckpt["obsnorm_state_dict"]
-    env = make_env(render_mode="human", obs_norm_sd=obs_norm)
-    policy_module, value_module = make_ppo_model(cfg.num_cells, env)
+    env = make_env(cfg, device=device, obs_norm_sd=obs_norm, render_mode="human")
+    policy_module, value_module = make_ppo_model(cfg.optim.num_cells, env, device)
     policy_module.load_state_dict(ckpt["policy_state_dict"])
     value_module.load_state_dict(ckpt["value_state_dict"])
     # optim.load_state_dict(ckpt["optimizer_state_dict"])
@@ -236,10 +238,27 @@ def load_and_demo_model(cfg: Config, model_path: str, device):
     env.transform[-1].eval()
 
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-        for _ in range(10):
-            env.rollout(
+        for _ in range(iteration):
+            rollout_tensordict = env.rollout(
                 1000, policy_module, break_when_any_done=True
             )  # 10000 ステップのロールアウトを実行
+            print(
+                f"obs: {rollout_tensordict['observation']}"
+            )
+            normalized_obs = TensorDict({
+                    "observation": rollout_tensordict["observation"]
+                },batch_size=[rollout_tensordict["observation"].shape[0]])
+
+            original_obs = env.transform[-1].inv(normalized_obs)
+            original_obs = original_obs["observation"]
+            obs_array = original_obs.cpu().numpy()
+            df_obs = pd.DataFrame(obs_array)
+            df_obs.to_csv("observation.csv", index=False, header=False)
+
+            action = rollout_tensordict["action"]
+            action_array = action.cpu().numpy()
+            df_action = pd.DataFrame(action_array)
+            df_action.to_csv("action.csv", index=False, header=False)
     env.close()
     del env, policy_module, value_module, obs_norm
 

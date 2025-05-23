@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import atexit
 import multiprocessing
+import os
 import signal
 import sys
 import warnings
@@ -36,11 +37,12 @@ from utils import (
 )
 from omegaconf import OmegaConf
 import hydra
+from hydra.utils import get_original_cwd
 
 warnings.filterwarnings("ignore")
 
 
-# @hydra.main(config_path="configs/", config_name="config")
+@hydra.main(config_path=None, config_name="config")
 def main(cfg: Config) -> None:
     print(OmegaConf.to_yaml(cfg))
 
@@ -65,11 +67,8 @@ def main(cfg: Config) -> None:
 
     if cfg.load_model:
         # ppo_InvertedDoublePendulum-v4_May15_10-29-00\best_model_93.pt
-        model_path = (
-            Path("models")
-            / "ppo_InvertedDoublePendulum-v4_May15_10-29-00/best_model_93.pt"
-        )
-        load_and_demo_model(cfg, model_path, device)
+        model_path = Path(get_original_cwd()) / cfg.load_model_path
+        load_and_demo_model(cfg, model_path, device, iteration=1)
         cleanup_resources()
         sys.exit(0)
 
@@ -87,8 +86,12 @@ def main(cfg: Config) -> None:
         )
     else:
         raise ValueError(f"Unknown checkpoint backend: {_CKPT_BACKEND}")
+    
+    run_dir = Path(os.getcwd())
+    logger = TensorboardLogger(exp_name=cfg.log.exp_name, log_dir=run_dir)
+    # モデル保存先が model_dir: "${hydra.run.dir}/models" なので
+    (run_dir / "models").mkdir(exist_ok=True)
 
-    logger = TensorboardLogger(exp_name=cfg.log.exp_name, log_dir=cfg.log.log_dir)
     for key, value in asdict(cfg).items():
         logger.experiment.add_text(key, str(value))
 
@@ -131,7 +134,6 @@ def main(cfg: Config) -> None:
         log_interval=cfg.log.tb_log_interval,
         clip_norm=cfg.optim.max_grad_norm,
         seed=cfg.env.seed,
-        save_trainer_file=save_trainer_file,
     )
 
     advantage_module = GAE(

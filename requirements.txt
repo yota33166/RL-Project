@@ -10,3 +10,5 @@ genesis
 pygame
 matplotlib
 numpy
+pandas
+hydra-core

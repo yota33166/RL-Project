@@ -1,6 +1,7 @@
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from hydra.core.config_store import ConfigStore
 
 
 @dataclass
@@ -53,18 +54,25 @@ class LogConfig:
 
     tb_log_interval: int = 1
     val_record_interval: int = 10
-    exp_name: str = f"ppo_{uuid.uuid4().hex[:6]}"
-    log_dir: Path = Path("logs") / exp_name
-    model_dir: Path = log_dir / "models"
+    # exp_name は Hydra ジョブ名をそのまま使う
+    exp_name: str = field(default_factory=lambda: "ppo_" + str(uuid.uuid4())[:8])
+    # ログ先は Hydra の run.dir を直接参照
+    log_dir: Path = Path("logs")
+    model_dir: Path = Path("models")
 
 
 @dataclass
 class Config:
     """Configuration class for the agent."""
 
-    load_model: bool = False
-    env: EnvConfig = EnvConfig()
-    collector: CollectorConfig = CollectorConfig()
-    optim: OptimConfig = OptimConfig()
-    loss: LossConfig = LossConfig()
-    log: LogConfig = LogConfig()
+    load_model: bool = True
+    load_model_path: Path = Path("best_model_93.pt")
+    env: EnvConfig = field(default_factory=EnvConfig)
+    collector: CollectorConfig = field(default_factory=CollectorConfig)
+    optim: OptimConfig = field(default_factory=OptimConfig)
+    loss: LossConfig = field(default_factory=LossConfig)
+    log: LogConfig = field(default_factory=LogConfig)
+
+
+cs = ConfigStore.instance()
+cs.store(name="config", node=Config)

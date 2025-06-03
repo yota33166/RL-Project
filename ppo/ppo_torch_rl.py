@@ -5,12 +5,14 @@ import os
 import signal
 import sys
 import warnings
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+import hydra
 import torch
 from config import Config
+from hydra.utils import get_original_cwd
+from omegaconf import OmegaConf
 from torch.multiprocessing import freeze_support
 from torchrl._utils import _CKPT_BACKEND
 from torchrl.envs.utils import ExplorationType
@@ -35,9 +37,6 @@ from utils import (
     make_env,
     make_ppo_model,
 )
-from omegaconf import OmegaConf
-import hydra
-from hydra.utils import get_original_cwd
 
 warnings.filterwarnings("ignore")
 
@@ -46,6 +45,7 @@ warnings.filterwarnings("ignore")
 def main(cfg: Config) -> None:
     print(OmegaConf.to_yaml(cfg))
 
+    # 並列処理のコンテキストを取得
     mp_context = multiprocessing.get_start_method()
     is_fork = mp_context == "fork"
 
@@ -54,7 +54,6 @@ def main(cfg: Config) -> None:
     )
     print(f"Using device: {device}")
     print(f"Using multiprocessing context: {mp_context}")
-    cfg = Config()
 
     freeze_support()  # Windows の場合、マルチプロセスのために必要
     num_workers = cfg.env.num_workers
@@ -65,6 +64,7 @@ def main(cfg: Config) -> None:
     )  # number of collectors for parallel envs
     print(f"Number of collectors: {num_collectors}")
 
+    # 学習済みモデルをロードする場合
     if cfg.load_model:
         # ppo_InvertedDoublePendulum-v4_May15_10-29-00\best_model_93.pt
         model_path = Path(get_original_cwd()) / cfg.load_model_path
@@ -72,6 +72,7 @@ def main(cfg: Config) -> None:
         cleanup_resources()
         sys.exit(0)
 
+    # トレーナー保存先のディレクトリを作成
     if _CKPT_BACKEND == "torchsnapshot":
         save_trainer_file = (
             cfg.log.model_dir
@@ -86,14 +87,15 @@ def main(cfg: Config) -> None:
         )
     else:
         raise ValueError(f"Unknown checkpoint backend: {_CKPT_BACKEND}")
-    
+
     run_dir = Path(os.getcwd())
     logger = TensorboardLogger(exp_name=cfg.log.exp_name, log_dir=run_dir)
     # モデル保存先が model_dir: "${hydra.run.dir}/models" なので
     (run_dir / "models").mkdir(exist_ok=True)
 
-    for key, value in asdict(cfg).items():
-        logger.experiment.add_text(key, str(value))
+    # TensorBoardに設定情報を追加
+    # for key, value in asdict(cfg).items():
+    #     logger.experiment.add_text(key, str(value))
 
     test_env = make_env(cfg, device=device)
     stats = get_norm_stats(test_env)

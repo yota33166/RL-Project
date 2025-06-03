@@ -3,8 +3,9 @@ import gc
 import sys
 import tempfile
 import warnings
-from typing import Dict
+from typing import Any, Dict, Optional
 
+import pandas as pd
 import torch
 from config import Config
 from tensordict.nn import TensorDictModule
@@ -25,18 +26,32 @@ from torchrl.envs import (
     TransformedEnv,
 )
 from torchrl.envs.libs.gym import GymEnv
-from torchrl.envs.utils import ExplorationType, TensorDict, TensorDictBase, set_exploration_type
+from torchrl.envs.utils import (
+    ExplorationType,
+    TensorDict,
+    TensorDictBase,
+    set_exploration_type,
+)
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from torchrl.objectives import ClipPPOLoss
+from torchrl.record.loggers.tensorboard import TensorboardLogger
 from torchrl.trainers import LogValidationReward, Trainer
 from torchrl.trainers.trainers import TrainerHookBase
-
-import pandas as pd
 
 warnings.filterwarnings("ignore")
 
 
 class SaveBestValidationReward(LogValidationReward):
+    """報酬の良いモデルを保存するトレーナーフック
+    このクラスは、評価時の報酬がこれまでの最良値を更新した場合に、
+    モデルと正規化統計を保存します。
+
+    Args:
+        LogValidationReward (_type_): _description_
+        cfg (Config): 設定オブジェクト
+        value_module (torch.nn.Module): 価値関数モジュール.保存用にのみ参照される
+    """
+
     def __init__(
         self,
         cfg: Config,
@@ -92,7 +107,23 @@ class SaveBestValidationReward(LogValidationReward):
 
 
 class LogLearningRate(TrainerHookBase):
-    def __init__(self, optimizer, logger, log_interval=1, name="learning_rate"):
+    """学習率をログに記録するトレーナーフック
+    このクラスは、最適化器の学習率を定期的にログに記録します。
+
+    Args:
+        optimizer (torch.optim.Optimizer): 学習率をログに記録する最適化器
+        logger (Logger): ログを記録するロガー
+        log_interval (int): 学習率をログに記録する間隔
+        name (str): ログの名前（デフォルトは "learning_rate"）
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        logger: TensorboardLogger,
+        log_interval: int = 1,
+        name: str = "learning_rate",
+    ):
         super().__init__()
         self.optimizer = optimizer
         self.logger = logger
@@ -110,7 +141,20 @@ class LogLearningRate(TrainerHookBase):
         trainer.register_op("post_optim", self, name=name)
 
 
-def env_maker(cfg: Config, device, render_mode=None):
+def env_maker(
+    cfg: Config, device: torch.device, render_mode: Optional[str] = None
+) -> GymEnv:
+    """環境を作成する関数
+    この関数は、指定された設定に基づいてGym環境を作成します。
+    もし `render_mode` が指定されていれば、レンダリングモードを設定します。
+    Args:
+        cfg (Config): 設定オブジェクト
+        device (torch.device): 使用するデバイス
+        render_mode (str, optional): レンダリングモード. デフォルトは None.
+    Returns:
+        GymEnv: 作成された環境
+    """
+
     env = GymEnv(
         env_name=cfg.env.env_name,
         from_pixels=False,
@@ -123,13 +167,26 @@ def env_maker(cfg: Config, device, render_mode=None):
 
 def make_env(
     cfg: Config,
-    device,
-    mp_context=None,
-    parallel=False,
-    obs_norm_sd=None,
+    device: torch.device,
+    mp_context: Optional[str] = None,
+    parallel: bool = False,
+    obs_norm_sd: Optional[Dict[str, Any]] = None,
     maker=env_maker,
-    render_mode=None,
-):
+    render_mode: Optional[str] = None,
+) -> TransformedEnv:
+    """環境を変換して作成する関数
+    この関数は、指定された設定に基づいて環境を作成し、観測の正規化や報酬のスケーリングなどの変換を適用します。
+    Args:
+        cfg (Config): 設定オブジェクト
+        device (torch.device): 使用するデバイス
+        mp_context (str, optional): マルチプロセスのコンテキスト. デフォルトは None.
+        parallel (bool, optional): 並列環境を使用するかどうか. デフォルトは False.
+        obs_norm_sd (Dict[str, Any], optional): 観測の正規化に使用する標準偏差. デフォルトは None.
+        maker (callable, optional): 環境を作成する関数. デフォルトは env_maker.
+        render_mode (str, optional): レンダリングモード. デフォルトは None.
+    Returns:
+        TransformedEnv: 作成された環境
+    """
     if obs_norm_sd is None:
         obs_norm_sd = {"standard_normal": True}
 
@@ -163,7 +220,7 @@ def make_env(
     return env
 
 
-def get_norm_stats(test_env):
+def get_norm_stats(test_env: TransformedEnv) -> Dict[str, Any]:
     test_env.transform[-1].init_stats(num_iter=1000, reduce_dim=0, cat_dim=0)
     obs_norm_sd = test_env.transform[-1].state_dict()
     test_env.close()
@@ -173,8 +230,17 @@ def get_norm_stats(test_env):
 
 # TODO: MLPモジュールつかって上手いことやる（2025/05/21）
 def make_ppo_model(
-    num_cells, dummy_env, device
+    num_cells: int, dummy_env: GymEnv, device: torch.device
 ) -> tuple[ProbabilisticActor, ValueOperator]:
+    """PPOモデルを作成する関数
+    この関数は、指定されたセル数に基づいてPPOモデルを構築します。
+    Args:
+        num_cells (int): ネットワークのセル数
+        dummy_env (GymEnv): ダミー環境
+        device (torch.device): 使用するデバイス
+    Returns:
+        tuple[ProbabilisticActor, ValueOperator]: 作成されたポリシーモジュールと価値モジュール
+    """
     actor_net = nn.Sequential(
         nn.LazyLinear(num_cells, device=device),
         nn.Tanh(),
@@ -219,7 +285,18 @@ def make_ppo_model(
     return policy_module, value_module
 
 
-def load_and_demo_model(cfg: Config, model_path: str, device, iteration: int = 1):
+def load_and_demo_model(
+    cfg: Config, model_path: str, device: torch.device, iteration: int = 1
+):
+    """モデルを読み込み、デモを実行する関数
+    この関数は、指定されたモデルパスからモデルを読み込み、
+    環境でデモを実行します。デモの結果は、観測とアクションをCSVファイルに保存します。
+    Args:
+        cfg (Config): 設定オブジェクト
+        model_path (str): モデルのパス
+        device (torch.device): 使用するデバイス
+        iteration (int, optional): デモの反復回数. デフォルトは 1.
+    """
     # モデルデータ読み込み
     ckpt = torch.load(model_path, map_location=device)
 
@@ -242,12 +319,11 @@ def load_and_demo_model(cfg: Config, model_path: str, device, iteration: int = 1
             rollout_tensordict = env.rollout(
                 1000, policy_module, break_when_any_done=True
             )  # 10000 ステップのロールアウトを実行
-            print(
-                f"obs: {rollout_tensordict['observation']}"
+            print(f"obs: {rollout_tensordict['observation']}")
+            normalized_obs = TensorDict(
+                {"observation": rollout_tensordict["observation"]},
+                batch_size=[rollout_tensordict["observation"].shape[0]],
             )
-            normalized_obs = TensorDict({
-                    "observation": rollout_tensordict["observation"]
-                },batch_size=[rollout_tensordict["observation"].shape[0]])
 
             original_obs = env.transform[-1].inv(normalized_obs)
             original_obs = original_obs["observation"]
@@ -263,30 +339,47 @@ def load_and_demo_model(cfg: Config, model_path: str, device, iteration: int = 1
     del env, policy_module, value_module, obs_norm
 
 
-""" Replay buffer """
-
-
-def get_replay_buffer(buffer_size, n_optim, batch_size, device):
+def get_replay_buffer(
+    buffer_size: int, prefetch: int, batch_size: int, device: torch.device
+) -> TensorDictReplayBuffer:
+    """リプレイバッファを取得する関数
+    この関数は、指定されたバッファサイズとバッチサイズに基づいてリプレイバッファを作成します。
+    Args:
+        buffer_size (int): リプレイバッファの最大サイズ
+        prefetch (int): あらかじめ読み込むサンプル数
+        batch_size (int): バッチサイズ
+        device (torch.device): 使用するデバイス
+    Returns:
+        TensorDictReplayBuffer: 作成されたリプレイバッファ
+    """
     replay_buffer = TensorDictReplayBuffer(
         batch_size=batch_size,
         storage=LazyMemmapStorage(max_size=buffer_size, scratch_dir=tempfile.mkdtemp()),
-        prefetch=n_optim,
+        prefetch=prefetch,
         sampler=SamplerWithoutReplacement(),
         transform=lambda td: td.to(device, non_blocking=True),
     )
     return replay_buffer
 
 
-""" Data collector"""
-
-
 def get_collector(
     cfg: Config,
-    mp_context,
-    stats,
-    policy,
-    device,
+    mp_context: str,
+    stats: Dict[str, Any],
+    policy: nn.Module,
+    device: torch.device,
 ):
+    """データコレクターを取得する関数
+    この関数は、指定された設定に基づいてデータコレクターを作成します。
+    Args:
+        cfg (Config): 設定オブジェクト
+        mp_context (str): マルチプロセスのコンテキスト
+        stats (Dict[str, Any]): 観測の正規化に使用する統計情報
+        policy (nn.Module): ポリシーモジュール
+        device (torch.device): 使用するデバイス
+    Returns:
+        SyncDataCollector or MultiSyncDataCollector: 作成されたデータコレクター
+    """
     if mp_context == "fork":
         collector_cls = SyncDataCollector
         env_arg = make_env(cfg, device, parallel=True, obs_norm_sd=stats)
@@ -312,7 +405,16 @@ def get_collector(
     return data_collector
 
 
-def get_loss_module(cfg: Config, actor_network, critic_network):
+def get_loss_module(cfg: Config, actor_network: nn.Module, critic_network: nn.Module):
+    """損失モジュールを取得する関数
+    この関数は、指定された設定に基づいてPPOの損失モジュールを作成します。
+    Args:
+        cfg (Config): 設定オブジェクト
+        actor_network (nn.Module): アクターネットワーク
+        critic_network (nn.Module): クリティックネットワーク
+    Returns:
+        ClipPPOLoss: 作成された損失モジュール
+    """
     loss_module = ClipPPOLoss(
         actor_network=actor_network,
         critic_network=critic_network,
@@ -328,6 +430,10 @@ def get_loss_module(cfg: Config, actor_network, critic_network):
 
 
 def cleanup_resources():
+    """リソースをクリーンアップする関数
+    この関数は、トレーナー、コレクター、およびテスト環境のリソースを解放します。
+    例外が発生した場合は、エラーメッセージを表示します。
+    """
     global trainer, collector, test_env
 
     print("Cleaning up resources...")
@@ -379,6 +485,13 @@ def cleanup_resources():
 
 
 def _signal_handler(signum, frame):
+    """シグナルハンドラー
+    この関数は、SIGINTやSIGTERMシグナルを受け取ったときに呼び出され、
+    リソースをクリーンアップし、プログラムを終了します。
+    Args:
+        signum (int): 受け取ったシグナル番号
+        frame (frame): 現在のスタックフレーム
+    """
     print(f"Signal {signum} received. Cleaning up resources...")
     cleanup_resources()
     sys.exit(0)

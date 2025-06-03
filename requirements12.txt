@@ -1,0 +1,21 @@
+# CUDA 12.1
+torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+torchaudio --index-url https://download.pytorch.org/whl/cu121
+torchrl
+
+# 物理シミュレーション環境．必要な環境のみをインストール
+# issac labを使用する場合は、リポジトリのクローンが必要（下記参照）
+# https://isaac-sim.github.io/IsaacLab/main/source/setup/quickstart.html
+# isaacsim[all,extscache]==4.5.0 --extra-index-url https://pypi.nvidia.com
+gymnasium == 0.29.1
+mujoco[all]
+genesis
+pygame
+
+# ロギングと可視化
+matplotlib
+numpy
+pandas
+hydra-core
+tensorboard

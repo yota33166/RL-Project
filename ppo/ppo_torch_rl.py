@@ -4,12 +4,14 @@ import multiprocessing
 import os
 import signal
 import sys
+import threading
 import warnings
 from datetime import datetime
 from pathlib import Path
 
 import hydra
 import torch
+import wandb
 from config import Config
 from hydra.utils import get_original_cwd
 from omegaconf import OmegaConf
@@ -18,6 +20,7 @@ from torchrl._utils import _CKPT_BACKEND
 from torchrl.envs.utils import ExplorationType
 from torchrl.objectives.value import GAE
 from torchrl.record.loggers.tensorboard import TensorboardLogger
+from torchrl.record.loggers.wandb import WandbLogger
 from torchrl.trainers import (
     BatchSubSampler,
     ClearCudaCache,
@@ -36,6 +39,7 @@ from utils import (
     load_and_demo_model,
     make_env,
     make_ppo_model,
+    resource_monitor,
 )
 
 warnings.filterwarnings("ignore")
@@ -43,6 +47,25 @@ warnings.filterwarnings("ignore")
 
 @hydra.main(config_path=None, config_name="config")
 def main(cfg: Config) -> None:
+    if multiprocessing.current_process().name == "MainProcess":
+        threading.Thread(target=resource_monitor, daemon=True).start()
+    run_dir = Path(os.getcwd())
+    # モデル保存先が model_dir: "${hydra.run.dir}/models" なので
+    (run_dir / "models").mkdir(exist_ok=True)
+
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    if cfg.wandb.enable:
+        wandb_logger = WandbLogger(
+            exp_name=cfg.log.exp_name,
+            project=cfg.wandb.project,
+            save_dir=cfg.wandb.save_dir,
+        )
+        # hparams に Hydra cfg 丸ごと投げ込み
+        wandb_logger.log_hparams(cfg_dict)
+        logger = wandb_logger
+    else:
+        logger = TensorboardLogger(exp_name=cfg.log.exp_name, log_dir=run_dir)
+
     print(OmegaConf.to_yaml(cfg))
 
     # 並列処理のコンテキストを取得
@@ -63,6 +86,14 @@ def main(cfg: Config) -> None:
         cfg.collector.env_per_collector
     )  # number of collectors for parallel envs
     print(f"Number of collectors: {num_collectors}")
+
+    wandb.config.update(
+        {
+            "device": str(device),
+            "num_workers": num_workers,
+            "num_collectors": num_collectors,
+        }
+    )
 
     # 学習済みモデルをロードする場合
     if cfg.load_model:
@@ -87,15 +118,6 @@ def main(cfg: Config) -> None:
         )
     else:
         raise ValueError(f"Unknown checkpoint backend: {_CKPT_BACKEND}")
-
-    run_dir = Path(os.getcwd())
-    logger = TensorboardLogger(exp_name=cfg.log.exp_name, log_dir=run_dir)
-    # モデル保存先が model_dir: "${hydra.run.dir}/models" なので
-    (run_dir / "models").mkdir(exist_ok=True)
-
-    # TensorBoardに設定情報を追加
-    # for key, value in asdict(cfg).items():
-    #     logger.experiment.add_text(key, str(value))
 
     test_env = make_env(cfg, device=device)
     stats = get_norm_stats(test_env)

@@ -1,6 +1,7 @@
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from hydra.core.config_store import ConfigStore
 
@@ -18,8 +19,8 @@ class EnvConfig:
         seed (int): 環境のシード値。デフォルトは 42。
     """
 
-    env_name: str = "InvertedDoublePendulum-v4"
-    num_workers: int = 4
+    env_name: str = "Ant-v4"  # 環境名を変更
+    num_workers: int = 16
     reward_scale: float = 0.01
     max_episode_steps: int = 1000
     frame_skip: int = 1
@@ -103,6 +104,18 @@ class LogConfig:
 
 
 @dataclass
+class WandbConfig:
+    """Weights & Biases の設定"""
+
+    enable: bool = True  # 有効化フラグ
+    project: str = "ppo_project"  # W&B プロジェクト名
+    offline: bool = False  # オフラインモード
+    save_dir: Path = field(default_factory=lambda: Path("wandb"))  # ログ保存先
+    id: Optional[str] = None  # 再開用 ID
+    video_fps: int = 32
+
+
+@dataclass
 class Config:
     """設定クラスの全体をまとめるクラス
     強化学習の全体的な設定を管理します。
@@ -123,6 +136,7 @@ class Config:
     optim: OptimConfig = field(default_factory=OptimConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     log: LogConfig = field(default_factory=LogConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
 
 # HydraのConfigStore に設定クラスを登録

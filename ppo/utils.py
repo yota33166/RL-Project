@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import gc
+import os
 import sys
 import tempfile
+import time
 import warnings
 from typing import Any, Dict, Optional
 
 import pandas as pd
+import psutil
 import torch
 from config import Config
 from tensordict.nn import TensorDictModule
@@ -482,6 +485,16 @@ def cleanup_resources():
                 torch.cuda.ipc_collect()
 
     print("Resources cleaned up.")
+
+
+def resource_monitor(cpu_thresh=90, mem_thresh=90, interval=5):
+    while True:
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory().percent
+        if cpu > cpu_thresh or mem > mem_thresh:
+            print(f"[WARN] Exiting: CPU={cpu}%, MEM={mem}%")
+            os._exit(1)  # 即時終了（safeではないが確実）
+        time.sleep(interval)
 
 
 def _signal_handler(signum, frame):

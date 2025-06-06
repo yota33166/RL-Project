@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 import hydra
+import mujoco
 import torch
 import wandb
 from config import Config
@@ -47,6 +48,12 @@ warnings.filterwarnings("ignore")
 
 @hydra.main(config_path=None, config_name="config")
 def main(cfg: Config) -> None:
+    # MuJoCo バインディングに solver_iter がなければ追加
+    if not hasattr(mujoco._structs.MjData, "solver_iter"):
+        # static な 0 を返すだけでも Gym の overlay 部分は飛ばせる
+        mujoco._structs.MjData.solver_iter = 0
+
+    # CPU のリソースを監視するスレッドを開始
     if multiprocessing.current_process().name == "MainProcess":
         threading.Thread(target=resource_monitor, daemon=True).start()
     run_dir = Path(os.getcwd())
@@ -54,7 +61,7 @@ def main(cfg: Config) -> None:
     (run_dir / "models").mkdir(exist_ok=True)
 
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-    if cfg.wandb.enable:
+    if cfg.wandb.enable and not cfg.load_model:
         wandb_logger = WandbLogger(
             exp_name=cfg.log.exp_name,
             project=cfg.wandb.project,
@@ -73,7 +80,7 @@ def main(cfg: Config) -> None:
     is_fork = mp_context == "fork"
 
     device = torch.device(
-        "cuda:0" if torch.cuda.is_available() and not is_fork else "cpu"
+        "cuda" if torch.cuda.is_available() and not is_fork else "cpu"
     )
     print(f"Using device: {device}")
     print(f"Using multiprocessing context: {mp_context}")
@@ -87,13 +94,14 @@ def main(cfg: Config) -> None:
     )  # number of collectors for parallel envs
     print(f"Number of collectors: {num_collectors}")
 
-    wandb.config.update(
-        {
-            "device": str(device),
-            "num_workers": num_workers,
-            "num_collectors": num_collectors,
-        }
-    )
+    if cfg.wandb.enable and not cfg.load_model:
+        wandb.config.update(
+            {
+                "device": str(device),
+                "num_workers": num_workers,
+                "num_collectors": num_collectors,
+            }
+        )
 
     # 学習済みモデルをロードする場合
     if cfg.load_model:

@@ -18,4 +18,6 @@ matplotlib
 numpy
 pandas
 hydra-core
+hydra-optuna-sweeper
+wandb
 tensorboard

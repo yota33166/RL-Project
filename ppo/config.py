@@ -39,7 +39,7 @@ class CollectorConfig:
 
     env_per_collector: int = 4
     frames_per_batch: int = 1024
-    total_frames: int = 1_024_000
+    total_frames: int = 2_048_000
 
 
 @dataclass
@@ -130,7 +130,7 @@ class Config:
     """
 
     load_model: bool = False
-    load_model_path: Path = Path("best_model_93.pt")
+    load_model_path: Path = Path("best_model_48.pt")
     env: EnvConfig = field(default_factory=EnvConfig)
     collector: CollectorConfig = field(default_factory=CollectorConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)

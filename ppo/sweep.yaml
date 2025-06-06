@@ -1,0 +1,47 @@
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+method: bayes
+metric:
+  goal: maximize
+  name: total_r_evaluation
+parameters:
+  collector:
+    frames_per_batch:
+      values:
+        - 512
+        - 1024
+        - 2048
+  optim:
+    num_cells:
+      values:
+        - 128
+        - 256
+        - 512
+    lr:
+      distribution: uniform
+      max: 0.0015
+      min: 0.00015
+  loss:
+    n_optim:
+      distribution: int_uniform
+      max: 10
+      min: 3
+
+    sub_batch_size:
+      values:
+        - 32
+        - 64
+        - 128
+        - 256
+    critic_coef:
+      distribution: uniform
+      max: 1
+      min: 0.01
+    entropy_eps:
+      distribution: uniform
+      max: 0.0002
+      min: 5e-05
+program: ppo_torch_rl.py
